@@ -40,8 +40,16 @@ minutes of continuous ~2.5 fps before WebSocket pongs stop). The guard:
 - `streak` = consecutive changed slots; `animating = streak >= 3`.
 - While animating, sends are rate-limited to one per
   `RENDERER_MIN_SEND_GAP_MS` (production 1000 ms → 1 fps sustained).
-- A static page never trips the guard (heartbeat only) and gets full
-  8 fps tap-to-frame.
+**Measured safety ceiling (2026-11-04 experiment):** the gap was raised to
+500 ms (2 fps) and run 30 min under real sustained page animation (~1.5 fps)
+with active touch. After ~10 min the board produced a near-freeze event
+(`pong_age` 33→50 s, `frame_age` 23.8 s stall, one HTTP timeout, self-recover
+in ~15 s) and the decode backlog grew ~37 frames per 5 min (decode ~1.54 fps
+vs receive ~1.63 fps). Rolled back to 1000 ms; backlog then shrank. **1 fps
+sustained (1000 ms) is the safe cap; 2 fps degrades in ~10 min under
+continuous animation.** Note the cap does not affect discrete changes at all
+— a page that changes occasionally still sends each change at full capture
+rate (~7–8 fps); only a page changing *every slot* hits the gap.
 
 **The trap:** a dashboard that *ticks* every second (clock, auto-updating
 widget) changes every capture slot too, so `streak` stays ≥ 3 and the guard is

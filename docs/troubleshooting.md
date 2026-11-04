@@ -54,6 +54,11 @@ lwIP. Mitigations (in production): JPEG transport (not raw),
 `RENDERER_MIN_SEND_GAP_MS=1000` animation guard, and the input-priority
 window (keeps taps responsive without lifting the sustained cap). Do **not**
 simply raise FPS or remove the guard to "fix" perceived sluggishness.
+Tested boundary (2026-11-04): 500 ms (2 fps) under real sustained ~1.5 fps
+page animation produced a near-freeze after ~10 min (50 s pong gap, 24 s
+frame stall, backlog +37/5min) then self-recovered; 1000 ms (1 fps) shows
+the backlog shrinking. The board's decode pipeline sustains ~1.5 fps under
+load — 1 fps is the safe operating point with margin.
 
 ### Renderer "crashes" — but node never crashed
 Forensics (the `crash1` episode): three service-level kills within 6 minutes,
