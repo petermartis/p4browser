@@ -1,0 +1,38 @@
+[Unit]
+Description=p4browser remote renderer (NAS)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment="RENDERER_SCREENCAST=0"
+# 8 fps = ~125ms tap-to-update. Change-gate keeps traffic near zero on static
+# dashboards; only a constantly-animating page sustains load.
+Environment="RENDERER_FPS=8"
+# Animation-only cap (ms between sends while a page changes every slot).
+# The demo dashboard animates continuously and degrades the board's lwIP
+# (~15-20 min at 2.5fps); 1000ms = 1fps sustained keeps it alive for hours.
+# Static dashboards are unaffected — full 8fps tap-to-frame.
+# NOTE: a *ticking* dashboard (clock) also trips this — the renderer's
+# 3-second input-priority window keeps tap responses fast in that case.
+Environment="RENDERER_MIN_SEND_GAP_MS=1000"
+Environment="RENDERER_HEARTBEAT_MS=5000"
+Environment="PORT=9100"
+# Pin the page to render (the board's NVS URL is ignored when set).
+Environment="PIN_URL=http://192.168.3.5:5050/viewer.html"
+# Board sends q=30 in its connect cfg; override so text stays crisp on the LCD.
+Environment="RENDERER_QUALITY=70"
+# DSM user journals are not readable from the shell — log to a file.
+Environment="RENDERER_LOG=/tmp/renderer_nas.log"
+Environment="WATCHDOG_LOG=/tmp/watchdog_nas.log"
+# EDIT: point at your renderer dir and node binary.
+ExecStart=/usr/bin/python3 /volume1/hermes/renderer/renderer_watchdog.py
+Restart=always
+RestartSec=2
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

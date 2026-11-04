@@ -1,0 +1,18 @@
+# p4browser — single-core P4-only layout (no C6 co-processor in v1).
+#
+# CRITICAL FIX: the previous layout (copied from the Guition C6 device) put the
+# primary app partition "ota_0" at 0x90000 and a C6 slot "c6_bl" at 0x10000.
+# We flashed our app to 0x10000 (per flash_args), so the bootloader NEVER loaded
+# it — it always booted the stale factory JD9365 "p4smoke" test sitting at
+# 0x90000. Every "no video" result was that old firmware, not our code.
+#
+# Now the app lives in the primary ota_0 slot at 0x10000 (bootloader default),
+# so the P4 actually runs our build.
+#
+# Name,   Type, SubType, Offset,  Size,    Flags
+nvs,      data, nvs,     0x9000,  0x4000,
+otadata,  data, ota,     0xd000,  0x2000,
+phy_init, data, phy,     0xf000,  0x1000,
+ota_0,    app,  ota_0,   0x10000, 0x3F0000,
+ota_1,    app,  ota_1,   0x400000,0x3F0000,
+storage,  data, spiffs,  0x7F0000,0x10000,

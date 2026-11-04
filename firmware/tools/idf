@@ -1,0 +1,15 @@
+#!/bin/bash
+# Wrapper: set up IDF env manually (export.sh's detect_python.sh clobbers "$@"), then run idf.py
+# Usage: ./idf [project_dir] <idf.py args...>   (default project_dir = this file's dir)
+IDF=/volume1/hermes/esp/esp-idf
+TP=/var/services/homes/foscam/.espressif
+PROJ="$(cd "$(dirname "$0")" && pwd)"
+export IDF_PATH="$IDF"
+export IDF_TOOLS_PATH="$TP"
+export IDF_SKIP_TOOLS_CHECK=1
+export IDF_PYTHON_ENV_PATH="$TP/python_env/idf5.4_py3.11_env"
+export ESP_ROM_ELF_DIR="$TP/tools/esp-rom-elfs/20241011"
+export PYTHONPATH="$IDF/tools/idf_py"
+export PATH="$TP/python_env/idf5.4_py3.11_env/bin:$IDF/tools:$TP/tools/riscv32-esp-elf/esp-14.2.0_20260121/bin:$TP/tools/xtensa-esp-elf/esp-14.2.0_20260121/bin:$TP/tools/esp32ulp-elf/2.38_20240113/bin:$TP/tools/openocd-esp32/v0.12.0-esp32-20260304/openocd-esp32/bin:$TP/tools/xtensa-esp-elf-gdb/16.3_20250913/bin:$TP/tools/riscv32-esp-elf-gdb/16.3_20250913/bin:/var/services/homes/foscam/.local/bin:$PATH"
+cd "$PROJ"
+exec idf.py "$@"

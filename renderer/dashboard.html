@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Homey Control</title>
+<style>
+  html, body { margin:0; padding:0; background:#0f1220; color:#eef; font-family:-apple-system, sans-serif; overflow:hidden; height:100%; }
+  #top { height:60px; display:flex; align-items:center; padding:0 18px; font-size:22px; font-weight:600; background:#161a2e; }
+  #top .count { margin-left:auto; font-size:15px; color:#8a93b2; font-weight:400; }
+  #nav { height:58px; display:flex; align-items:center; justify-content:center; gap:28px; background:#131728; }
+  #nav button { font-size:30px; width:96px; height:46px; border-radius:12px; border:2px solid #2a3052; background:#1a1f38; color:#eef; cursor:pointer; line-height:1; }
+  #nav button:active { background:#2a3052; }
+  #nav .page { font-size:20px; min-width:130px; text-align:center; color:#8a93b2; }
+  #grid { display:grid; grid-template-columns:repeat(4, 1fr); grid-template-rows:repeat(4, 1fr); gap:10px; padding:10px; height:calc(100vh - 118px); }
+  .dev { background:#1a1f38; border:2px solid #2a3052; border-radius:14px; padding:8px 10px; text-align:center; cursor:pointer; user-select:none; display:flex; flex-direction:column; justify-content:center; }
+  .dev .name { font-size:15px; margin-bottom:8px; line-height:1.2; }
+  .dev .sw { width:70px; height:38px; background:#333a5c; border-radius:19px; margin:0 auto; position:relative; transition:background .15s; }
+  .dev .sw::after { content:''; position:absolute; width:30px; height:30px; background:#cfd6f0; border-radius:50%; top:4px; left:4px; transition:left .15s; }
+  .dev.on { border-color:#4ecca3; }
+  .dev.on .sw { background:#4ecca3; }
+  .dev.on .sw::after { left:36px; background:#0f1220; }
+  .dev.on .name { color:#4ecca3; }
+  .dev:active { transform:scale(.97); }
+</style>
+</head>
+<body>
+<div id="top">Homey Control<span class="count" id="count">loading…</span></div>
+<div id="nav">
+  <button id="prev">&#8249;</button>
+  <div class="page" id="page">1 / 1</div>
+  <button id="next">&#8250;</button>
+</div>
+<div id="grid"></div>
+<script>
+let devices = [];
+let page = 0;
+const PER_PAGE = 16;
+async function load() {
+  try {
+    const r = await fetch('/api/devices');
+    const d = await r.json();
+    if (!Array.isArray(d)) throw new Error(d.error || 'bad response');
+    for (const nd of d) {
+      const ex = devices.find(x => x.id === nd.id);
+      if (ex) ex.on = nd.on; else devices.push(nd);
+    }
+    render();
+    document.getElementById('count').textContent = devices.length + ' devices';
+  } catch (e) {
+    document.getElementById('count').textContent = 'error: ' + e.message;
+  }
+}
+function render() {
+  const pages = Math.max(1, Math.ceil(devices.length / PER_PAGE));
+  if (page >= pages) page = pages - 1;
+  if (page < 0) page = 0;
+  document.getElementById('page').textContent = (page + 1) + ' / ' + pages;
+  const slice = devices.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
+  const g = document.getElementById('grid');
+  g.innerHTML = '';
+  for (const d of slice) {
+    const el = document.createElement('div');
+    el.className = 'dev' + (d.on ? ' on' : '');
+    const nm = document.createElement('div'); nm.className = 'name'; nm.textContent = d.name;
+    const sw = document.createElement('div'); sw.className = 'sw';
+    el.appendChild(nm); el.appendChild(sw);
+    el.onclick = async () => {
+      const prev = d.on;
+      const on = !prev;
+      d.on = on;
+      el.className = 'dev' + (on ? ' on' : '');
+      const revert = () => { d.on = prev; el.className = 'dev' + (prev ? ' on' : ''); };
+      try {
+        const tr = await fetch('/api/toggle?device=' + encodeURIComponent(d.id) + '&on=' + on);
+        const tj = await tr.json();
+        if (!tj.ok) revert();
+      } catch (e) { revert(); }
+    };
+    g.appendChild(el);
+  }
+}
+document.getElementById('prev').onclick = () => { page--; render(); };
+document.getElementById('next').onclick = () => { page++; render(); };
+load();
+setInterval(load, 8000);
+</script>
+</body>
+</html>

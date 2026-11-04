@@ -1,0 +1,81 @@
+# p4browser v2 — ESP32-P4 + ESP32-C6 (esp-hosted) + captive portal
+# 16MB flash, 32MB PSRAM (OCT 200M — proven v1 config, must not drift).
+CONFIG_IDF_TARGET="esp32p4"
+
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# PSRAM (32MB) — v1 proven values
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_SIZE_32MB=y
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+
+# MIPI-DSI / experimental (needed for the JD9365/JC8012P4A1 DPI panel)
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+CONFIG_ESP32P4_DATA_CACHE_64KB=y
+CONFIG_ESP32P4_INSTRUCTION_CACHE_64KB=y
+
+# NOTE: this board's ESP32-P4 is REV v1.0 (esptool-confirmed), NOT v3.
+# Leave min-rev <300 (default) so the DSI PHY auto-selects PLL_F20M, which is
+# the correct reference clock for pre-v3 silicon. Do NOT enable v3 mode.
+
+# Watchdog off for display bring-up
+CONFIG_ESP_TASK_WDT_EN=n
+CONFIG_ESP32_REBOOT_RETURN_TO_BOOTLOADER=y
+
+# Console — this board's USB-C port is a UART0 bridge (NOT native USB-JTAG).
+# UART0 @921600 (baud was bumped from 115200 in v1.9 — the Mac capture was
+# verified at 921600).
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=921600
+CONFIG_COMPILER_LOG_LEVEL_INFO=y
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# --- v2: ESP32-C6 co-processor over SDIO (esp-hosted 2.12.12) ---
+# The P4's SDIO is IOMUXed: slot 1 (the default) is wired to exactly this
+# board's C6 (CMD19 / CLK18 / D0-3 = 14-17 / reset 54, active-high). The
+# "FUNC_BOARD" P4 profile encodes this wiring; the example reference sets
+# ESP_HOSTED_ENABLED + SDIO host interface.
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE=y
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+CONFIG_ESP_HOSTED_SDIO_BUS_WIDTH=4
+CONFIG_ESP_HOSTED_P4_DEV_BOARD_FUNC_BOARD=y
+# v3: LVGL (fonts + object tree) fragments internal DRAM, so the SDIO
+# transport mempool's ~48 KB aligned alloc no longer fits in the internal
+# heap -> "mempool create failed: no mem" assert + reboot loop (display dark).
+# P4's GDMA can DMA through PSRAM, so let the mempool use PSRAM instead.
+CONFIG_ESP_HOSTED_MEMPOOL_PREFER_SPIRAM=y
+
+# WiFi + captive portal
+CONFIG_ESP_WIFI=y
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_ESP_WIFI_STA_SUPPORT=y
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# Partitions (P4-only — C6 firmware lives in the C6's own flash)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partition.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partition.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# --- v3: LVGL 9 browser UI ---
+CONFIG_LV_USE_DRAW_SW=y
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_32=y
+CONFIG_LV_FONT_MONTSERRAT_40=y
+
+# --- v3: HTTPS via embedded CA bundle ---
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_STATS_FORMATTING_FUNCTIONS=y
+CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y

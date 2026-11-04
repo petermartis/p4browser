@@ -1,0 +1,35 @@
+#!/bin/bash
+# Wrapper for ESP-IDF 5.5 builds of p4browser (espcontrol reference runs 5.5.4).
+# Same manual-env approach as ./idf (5.4): export.sh's detect_python.sh clobbers "$@".
+# Usage: ./idf55 <idf.py args...>
+IDF=/volume1/hermes/esp/esp-idf-5.5
+TP=/var/services/homes/foscam/.espressif
+PROJ="$(cd "$(dirname "$0")" && pwd)"
+export IDF_PATH="$IDF"
+export IDF_TOOLS_PATH="$TP"
+export IDF_SKIP_TOOLS_CHECK=1
+# 5.5's strict tool-version gate rejects the NAS's esp-14.2.0_20260121 toolchain
+# (same GCC 14.2.0 crosstool, newer build date than the pinned 20241119).
+# IDF_MAINTAINER demotes that FATAL_ERROR to a WARNING.
+export IDF_MAINTAINER=1
+# esp_wifi_remote / esp_hosted Kconfig pull version-specific files via
+#   orsource "./Kconfig.idf_v$ESP_IDF_VERSION.in"
+# kconfiglib expands $ESP_IDF_VERSION with os.path.expandvars (an ENV var, not a
+# kconfig var). With it unset the path becomes ./Kconfig.idf_v.in (skipped,
+# optional) -> SLAVE_IDF_TARGET + WIFI_RMT_* never load -> co-proc defaults to
+# the wrong target. Set it to our IDF minor so it resolves to Kconfig.idf_v5.5.in.
+export ESP_IDF_VERSION=5.5
+# 5.5 python env (created by ./idf55-tools on first run)
+export IDF_PYTHON_ENV_PATH="$TP/python_env/idf5.5_py3.11_env"
+export ESP_ROM_ELF_DIR="$TP/tools/esp-rom-elfs/20241011"
+export PYTHONPATH="$IDF/tools/idf_py"
+export PATH="$TP/python_env/idf5.5_py3.11_env/bin:$IDF/tools:$TP/tools/riscv32-esp-elf/esp-14.2.0_20260121/bin:$TP/tools/xtensa-esp-elf/esp-14.2.0_20260121/bin:$TP/tools/esp32ulp-elf/2.38_20240113/bin:$TP/tools/openocd-esp32/v0.12.0-esp32-20260304/openocd-esp32/bin:$TP/tools/xtensa-esp-elf-gdb/16.3_20250913/bin:$TP/tools/riscv32-esp-elf-gdb/16.3_20250913/bin:/var/services/homes/foscam/.local/bin:$PATH"
+cd "$PROJ"
+# IDF 5.5 compat: esp_hosted 2.12.x Kconfig uses $(ESP_IDF_VERSION) (a 6.1+
+# kconfiglib macro) for an SPI-HD 1-bit option we never use. Neutralize it so
+# kconfiglib doesn't die with MacroNotDefinedException on every configure.
+KH="$PROJ/managed_components/espressif__esp_hosted/Kconfig"
+if [ -f "$KH" ] && grep -q 'depends on \$(ESP_IDF_VERSION)' "$KH"; then
+  sed -i 's/depends on \$(ESP_IDF_VERSION) >= "6.1"/depends on 0 # IDF 5.5 compat: macro is 6.1+/' "$KH"
+fi
+exec idf.py "$@"
