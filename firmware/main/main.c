@@ -44,6 +44,7 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include <stdio.h>
 #include "esp_http_server.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -849,6 +850,66 @@ static esp_err_t reboot_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* Reboot diagnostics: human-readable esp_reset_reason(). */
+static const char *reset_reason_str(int r)
+{
+    switch (r) {
+    case 0:  return "unknown";
+    case 1:  return "poweron";
+    case 2:  return "external";
+    case 3:  return "software(esp_restart)";
+    case 4:  return "panic";
+    case 5:  return "int_wdt";
+    case 6:  return "task_wdt";
+    case 7:  return "wdt";
+    case 8:  return "deep_sleep";
+    case 9:  return "brownout";
+    case 10: return "sdio";
+    case 11: return "usb";
+    case 12: return "jtag";
+    case 13: return "efuse";
+    case 14: return "gpio";
+    case 15: return "uart_download";
+    case 16: return "chip_version";
+    case 17: return "cpu_lockup";
+    case 18: return "rtc_wdt";
+    default: return "other";
+    }
+}
+
+/* Boot counter, persisted in NVS across reboots. A boot_count > 1 right after
+ * a dashboard update is the C6 crash-loop signature — visible remotely via
+ * /boot without a serial console. */
+static uint32_t s_boot_count = 0;
+static void boot_count_bump(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("sys", NVS_READWRITE, &h) != ESP_OK) return;
+    uint32_t bc = 0;
+    nvs_get_u32(h, "boot_count", &bc);
+    s_boot_count = ++bc;
+    nvs_set_u32(h, "boot_count", s_boot_count);
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* GET /boot — reboot diagnostics: WHY this boot happened (reset_reason) and
+ * how many consecutive boots (boot_count). Confirms the C6 crash-loop. */
+static esp_err_t boot_diag_handler(httpd_req_t *req)
+{
+    const esp_app_desc_t *ad = esp_app_get_description();
+    char buf[240];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"reset_reason\":\"%s\",\"boot_count\":%u,"
+        "\"app_version\":\"%s\",\"app_time\":\"%s\"}",
+        reset_reason_str((int)esp_reset_reason()),
+        (unsigned)s_boot_count,
+        ad ? ad->version : "?",
+        ad ? ad->time : "?");
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, buf, n);
+}
+
 /* v5: GET /factory — wipe wifi + renderer config, reboot into the WiFi portal. */
 static esp_err_t factory_handler(httpd_req_t *req)
 {
@@ -980,6 +1041,7 @@ static esp_err_t start_portal(void)
     u.uri = "/screen";     u.method = HTTP_GET; u.handler = screen_handler;     httpd_register_uri_handler(srv, &u);
     memset(&u, 0, sizeof(u));
     u.uri = "/reboot";     u.method = HTTP_GET; u.handler = reboot_handler;     httpd_register_uri_handler(srv, &u);
+    u.uri = "/boot";       u.method = HTTP_GET; u.handler = boot_diag_handler;  httpd_register_uri_handler(srv, &u);
     memset(&u, 0, sizeof(u));
     u.uri = "/factory";    u.method = HTTP_GET; u.handler = factory_handler;    httpd_register_uri_handler(srv, &u);
     memset(&u, 0, sizeof(u));
@@ -1119,7 +1181,7 @@ static esp_err_t c6_ota_recover(void)
         ESP_LOGE(TAG, "C6 OTA begin failed");
         return ESP_FAIL;
     }
-    const uint8_t chunk[1500];
+    uint8_t chunk[1500];
     size_t off = 0;
     while (off < fw_size) {
         size_t n = (fw_size - off) > sizeof(chunk) ? sizeof(chunk) : (fw_size - off);
@@ -1139,6 +1201,41 @@ static esp_err_t c6_ota_recover(void)
     if (esp_hosted_slave_ota_activate() != ESP_OK) { ESP_LOGE(TAG, "C6 OTA activate failed"); return ESP_FAIL; }
     ESP_LOGI(TAG, "C6 firmware activated — C6 rebooting, reconnecting...");
     return ESP_OK;
+}
+
+/* The C6 wedges intermittently; a full re-init revives a *mildly* wedged one,
+ * but a *deeply* wedged C6 only comes back from a power cycle (a reboot). The
+ * old code re-init'd ONCE and rebooted immediately on failure — so a wedged C6
+ * crash-looped 3-4 times (each reboot a power cycle) before it recovered.
+ * Retry the re-init several times with back-off: giving the C6 time to settle
+ * often lets a later attempt succeed, cutting the crash-loop to 0-1 reboots.
+ * Only fall back to esp_restart() when every attempt fails (deep wedge).
+ *
+ * ctx: 1 = link-drop path (healthy link lost), 2 = STA-failed-3x path.
+ * Returns true if a re-init succeeded (no reboot); the reboot path never returns.
+ */
+static bool c6_reinit_or_reboot(int ctx)
+{
+    const int REINIT_MAX = 4;
+    for (int attempt = 1; attempt <= REINIT_MAX; attempt++) {
+        if (s_c6_mutex) xSemaphoreTake(s_c6_mutex, portMAX_DELAY);
+        esp_err_t rr = c6_hosted_reinit();
+        if (s_c6_mutex) xSemaphoreGive(s_c6_mutex);
+        if (rr == ESP_OK) {
+            ESP_LOGI(TAG, "C6 re-init OK on attempt %d/%d (ctx=%d) — no reboot",
+                     attempt, REINIT_MAX, ctx);
+            return true;
+        }
+        ESP_LOGW(TAG, "C6 re-init attempt %d/%d failed (err %d, ctx=%d)",
+                 attempt, REINIT_MAX, (int)rr, ctx);
+        if (attempt < REINIT_MAX) {
+            vTaskDelay(pdMS_TO_TICKS(2000 * attempt)); /* back-off: 2s, 4s, 6s */
+        }
+    }
+    ESP_LOGE(TAG, "C6 re-init failed %d times (ctx=%d) — rebooting in 3 s", REINIT_MAX, ctx);
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    esp_restart();
+    return false; /* not reached */
 }
 
 /* Whole C6 + WiFi bring-up. Runs in its own task so the display cycler keeps
@@ -1270,29 +1367,14 @@ static void c6_wifi_task(void *arg)
                 /* A healthy link that dropped means the C6 may be wedged —
                  * full re-init before re-driving (plain bringup won't revive it). */
                 if (need_reinit) {
-                    if (s_c6_mutex) xSemaphoreTake(s_c6_mutex, portMAX_DELAY);
-                    esp_err_t rr = c6_hosted_reinit();
-                    if (s_c6_mutex) xSemaphoreGive(s_c6_mutex);
-                    if (rr != ESP_OK) {
-                        ESP_LOGE(TAG, "C6 re-init failed — rebooting in 3 s");
-                        vTaskDelay(pdMS_TO_TICKS(3000));
-                        esp_restart();
-                    }
+                    c6_reinit_or_reboot(1); /* retry w/ back-off; reboot only if all fail */
                 }
                 continue; /* next drive cycle */
             }
-            /* 3x STA failed this cycle: full re-init of the C6, then loop. */
-            ESP_LOGW(TAG, "STA failed 3x (cycle %d) — full C6 re-init, then retry", cycle);
-            if (s_c6_mutex) xSemaphoreTake(s_c6_mutex, portMAX_DELAY);
-            esp_err_t rr = c6_hosted_reinit();
-            if (s_c6_mutex) xSemaphoreGive(s_c6_mutex);
-            if (rr != ESP_OK) {
-                /* Hosted link itself is dead — re-init failed. A full board
-                 * restart is the cleanest reset of a wedged C6. */
-                ESP_LOGE(TAG, "C6 re-init failed — rebooting in 3 s");
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                esp_restart();
-            }
+            /* 3x STA failed this cycle: full re-init of the C6 (retried w/
+             * back-off — a deeply wedged C6 may still need a reboot), then loop. */
+            ESP_LOGW(TAG, "STA failed 3x (cycle %d) — full C6 re-init (retried), then retry", cycle);
+            c6_reinit_or_reboot(2);
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
         /* (unreachable — the watchdog loops forever) */
@@ -1320,6 +1402,13 @@ void app_main(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     nvs_flash_init(); /* idempotent; needed for wifi NVS + esp_wifi_remote */
+
+    /* Reboot diagnostics: persistent boot counter + reset reason, exposed
+     * remotely at GET /boot. A boot_count > 1 right after a dashboard update
+     * is the C6 crash-loop signature. */
+    boot_count_bump();
+    ESP_LOGW(TAG, "boot #%u, reset_reason=%s", s_boot_count,
+             reset_reason_str((int)esp_reset_reason()));
 
     /* If we booted as the result of an OTA update, confirm the new image so it
      * sticks. Returns an error when this boot wasn't an OTA update (normal
