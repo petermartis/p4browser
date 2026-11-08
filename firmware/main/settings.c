@@ -216,6 +216,29 @@ static void on_save(lv_event_t *e)
     }
 }
 
+/* Reload the pinned dashboard on the renderer WITHOUT a board reboot: tell the
+ * NAS renderer (GET /reload on its control port) to re-fetch the page in the
+ * running Chrome. The network call can block up to ~6 s, so it runs in its own
+ * task — the LVGL task only sets the "reloading…" label, and the task updates
+ * the result under the LVGL lock (so the UI never freezes on a slow renderer). */
+static void reload_ui_task(void *arg)
+{
+    (void)arg;
+    bool ok = renderer_reload_do();
+    if (browser_lvgl_trylock(3000)) {
+        set_status(ok ? "reloaded \xE2\x9C\x93" : "reload failed \xE2\x80\x94 renderer unreachable");
+        browser_lvgl_unlock();
+    }
+    vTaskDelete(NULL);
+}
+
+static void on_reload(lv_event_t *e)
+{
+    (void)e;
+    set_status("reloading dashboard…");
+    xTaskCreate(reload_ui_task, "rdreload", 8192, NULL, 5, NULL);
+}
+
 /* ============================ screen build ============================ */
 
 static void add_section(lv_obj_t *parent, const char *text)
@@ -277,7 +300,7 @@ static lv_obj_t *settings_mk_col(lv_obj_t *parent, int32_t x, int32_t w)
 static lv_obj_t *add_button(lv_obj_t *parent, int x, const char *text, uint32_t bg, lv_event_cb_t cb, lv_obj_t **out_label)
 {
     lv_obj_t *b = lv_button_create(parent);
-    lv_obj_set_size(b, 290, 80);
+    lv_obj_set_size(b, 232, 80);
     /* BOTTOM align y-ofs is ADDITIVE in +y (DOWN): lv_area_align sets
      * y1 = (base_h - obj_h) + ofs_y, so a POSITIVE ofs_y pushes the button
      * BELOW the screen edge (the "sunk buttons" bug: +40 then +60 each cut
@@ -372,11 +395,13 @@ static void build_settings_screen(void)
     lv_obj_set_style_text_color(s_slider_lbl, lv_color_white(), 0);
     lv_obj_set_style_pad_left(s_slider_lbl, 20, 0);
 
-    /* bottom button bar (always visible, below the scroll area) */
-    add_button(s_scr, 30, "Back", 0x37474F, on_back, NULL);
-    add_button(s_scr, 345, "Save & apply", 0x2E7D32, on_save, NULL);
-    add_button(s_scr, 660, "Reboot", 0x37474F, on_reboot, NULL);
-    s_btn_factory = add_button(s_scr, 975, "Factory", 0xC62828, on_factory, &s_btn_factory_lbl);
+    /* bottom button bar (always visible, below the scroll area). Five buttons
+     * at 232 px wide: Back / Save & apply / Reboot / Reload / Factory. */
+    add_button(s_scr, 20, "Back", 0x37474F, on_back, NULL);
+    add_button(s_scr, 272, "Save & apply", 0x2E7D32, on_save, NULL);
+    add_button(s_scr, 524, "Reboot", 0x37474F, on_reboot, NULL);
+    add_button(s_scr, 776, "Reload", 0x1565C0, on_reload, NULL);
+    s_btn_factory = add_button(s_scr, 1028, "Factory", 0xC62828, on_factory, &s_btn_factory_lbl);
 
     /* shared keyboard, shown while a field is focused (sits above the bar) */
     s_kb = lv_keyboard_create(s_scr);

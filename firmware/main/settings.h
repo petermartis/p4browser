@@ -39,3 +39,12 @@ void  remote_cfg_get(char *host, int host_len, int *port, char *url, int url_len
 void  remote_stop(void);        /* stop remote + touch tasks (any task, waits) */
 void  remote_start(void);       /* (re)start them; no-op if already running */
 void  remote_touch_reset(void); /* swallow the next release edge (settings close) */
+
+/* ---- main.c (dashboard reload via the renderer's control endpoint) ----
+ * The NAS renderer (renderer.js) runs a small HTTP control server next to the
+ * frame-stream WS server. GET /reload re-fetches the pinned dashboard in the
+ * running Chrome, so the board shows the new design WITHOUT a reboot. */
+#define CFG_CONTROL_PORT 5052
+bool  renderer_reload_do(void); /* GET <host>:CFG_CONTROL_PORT/reload; true on HTTP 200.
+                                    BLOCKS up to ~6 s — call from a worker task, never the
+                                    LVGL task (it would freeze the UI). */

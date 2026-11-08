@@ -46,6 +46,7 @@
 #include "esp_event.h"
 #include <stdio.h>
 #include "esp_http_server.h"
+#include "esp_http_client.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_system.h"
@@ -496,7 +497,7 @@ static const char *PAGE_HEAD =
     ".row{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}"
     ".row form{margin:0}"
     "button{font-size:15px;padding:12px 18px;border:0;border-radius:10px;color:#fff;cursor:pointer}"
-    ".save{background:#2e7d32}.reboot{background:#37474f}.factory{background:#c62828}.screen{background:#1f6feb}"
+    ".save{background:#2e7d32}.reboot{background:#37474f}.factory{background:#c62828}.screen{background:#1f6feb}.reload{background:#1565c0}"
     ".bval{color:#fff;font-weight:600}.mut{color:#8b98a5;font-size:12px}"
     "</style></head><body><h1>p4browser</h1>";
 
@@ -690,6 +691,7 @@ static esp_err_t portal_root(httpd_req_t *req)
         "</form>"
         "<div class=\"row\">"
         "<form method=\"get\" action=\"/reboot\"><button class=\"reboot\">Reboot</button></form>"
+        "<form method=\"get\" action=\"/reload\"><button class=\"reload\">Reload dashboard</button></form>"
         "<form method=\"get\" action=\"/screen?cfg=1\"><button class=\"screen\">On-device settings</button></form>"
         "<form method=\"get\" action=\"/factory\" onsubmit=\"return confirm('Factory reset wipes Wi-Fi + renderer config and reboots. Continue?')\">"
         "<button class=\"factory\">Factory reset</button></form>"
@@ -1005,13 +1007,65 @@ static esp_err_t ota_handler(httpd_req_t *req)
     return ESP_OK; /* not reached */
 }
 
+/* Refresh the pinned dashboard on the NAS renderer WITHOUT rebooting the board:
+ * GET http://<renderer_host>:CFG_CONTROL_PORT/reload — the renderer's control
+ * endpoint re-fetches the pinned page in the running Chrome, so the board shows
+ * the new design in ~2 s. BLOCKING (up to ~6 s), so call it from a worker task
+ * (the local button) or the httpd task (web_reload_handler), never the LVGL task. */
+bool renderer_reload_do(void)
+{
+    char host[64] = {0};
+    int  port = 0;
+    char url[160] = {0};
+    remote_cfg_get(host, sizeof(host), &port, url, sizeof(url));
+    if (!host[0]) {
+        ESP_LOGW(TAG, "renderer reload: no host configured");
+        return false;
+    }
+    char target[144];
+    int  tl = snprintf(target, sizeof(target), "http://%s:%d/reload", host, CFG_CONTROL_PORT);
+    if (tl < 0 || (size_t)tl >= sizeof(target)) return false;
+
+    esp_http_client_config_t cfg = { .url = target, .timeout_ms = 6000 };
+    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+    if (!c) {
+        ESP_LOGE(TAG, "renderer reload: http_client_init failed for %s", target);
+        return false;
+    }
+    esp_err_t err = esp_http_client_perform(c);
+    int  code = (err == ESP_OK) ? esp_http_client_get_status_code(c) : -1;
+    bool ok   = (code == 200);
+    esp_http_client_cleanup(c);
+    ESP_LOGI(TAG, "renderer reload -> %s (http %d)", target, code);
+    return ok;
+}
+
+/* GET /reload — the web twin of the on-device "Reload" button. Runs the (up to
+ * ~6 s) renderer reload, then shows a friendly page that auto-redirects back to
+ * the config screen. */
+static esp_err_t web_reload_handler(httpd_req_t *req)
+{
+    bool ok = renderer_reload_do();
+    httpd_resp_set_type(req, "text/html");
+    if (ok) {
+        httpd_resp_send(req,
+            "<h1>Reloaded</h1><p>The board is re-fetching the dashboard (no reboot).</p>"
+            "<meta http-equiv=\"refresh\" content=\"2;url=/\">", HTTPD_RESP_USE_STRLEN);
+    } else {
+        httpd_resp_send(req,
+            "<h1>Reload failed</h1><p>The renderer was unreachable &mdash; is the NAS renderer running?</p>"
+            "<meta http-equiv=\"refresh\" content=\"3;url=/\">", HTTPD_RESP_USE_STRLEN);
+    }
+    return ESP_OK;
+}
+
 static esp_err_t start_portal(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port      = 80;
     cfg.ctrl_port        = 32768;
     cfg.stack_size       = 8192;   /* /state + handlers use larger frames */
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 18;
     cfg.lru_purge_enable = true;
     httpd_handle_t srv = NULL;
     if (httpd_start(&srv, &cfg) != ESP_OK) {
@@ -1041,7 +1095,10 @@ static esp_err_t start_portal(void)
     u.uri = "/screen";     u.method = HTTP_GET; u.handler = screen_handler;     httpd_register_uri_handler(srv, &u);
     memset(&u, 0, sizeof(u));
     u.uri = "/reboot";     u.method = HTTP_GET; u.handler = reboot_handler;     httpd_register_uri_handler(srv, &u);
+    memset(&u, 0, sizeof(u));
     u.uri = "/boot";       u.method = HTTP_GET; u.handler = boot_diag_handler;  httpd_register_uri_handler(srv, &u);
+    memset(&u, 0, sizeof(u));
+    u.uri = "/reload";     u.method = HTTP_GET; u.handler = web_reload_handler; httpd_register_uri_handler(srv, &u);
     memset(&u, 0, sizeof(u));
     u.uri = "/factory";    u.method = HTTP_GET; u.handler = factory_handler;    httpd_register_uri_handler(srv, &u);
     memset(&u, 0, sizeof(u));
