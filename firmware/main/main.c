@@ -48,6 +48,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_system.h"
+#include "esp_ota_ops.h"   /* app OTA: POST /ota streams a new image to the other slot */
 #include "driver/ledc.h"
 #include "settings.h"
 
@@ -67,6 +68,8 @@ extern void      browser_diag(char *buf, size_t len);
 extern void      browser_touch_start(void);
 /* remote.c (v4: NAS-rendered Homey via WS + HW JPEG) */
 extern void      remote_start(void);
+extern void      remote_stop(void);
+extern void      remote_cfg_get(char *host, int host_len, int *port, char *url, int url_len);
 
 /* --- Board pins (espcontrol JC8012P4A1) --- */
 #define BK_GPIO       23
@@ -429,29 +432,14 @@ static void wifi_event_cb(void *arg, esp_event_base_t base, int32_t id, void *da
     }
 }
 
-/* --- Captive portal (esp_http_server catch-all) --- */
-static const char *PORTAL_HTML =
-    "<!doctype html><html><head><meta charset=\"utf-8\">"
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>p4browser - configure Wi-Fi</title></head>"
-    "<body style=\"font-family:sans-serif;max-width:420px;margin:40px auto;color:#222\">"
-    "<h1>p4browser</h1>"
-    "<p>This device is not connected to the internet yet. Enter your Wi-Fi "
-    "network to configure it.</p>"
-    "<form method=\"post\" action=\"/config\">"
-    "<label>Network (SSID)<br><input name=\"ssid\" required style=\"width:100%\"></label><br>"
-    "<label>Password<br><input name=\"pass\" style=\"width:100%\"></label><br>"
-    "<br><button type=\"submit\" style=\"padding:10px 20px\">Save &amp; connect</button>"
-    "</form>"
-    "<p style=\"color:#888;font-size:12px\">The device reboots after saving, then "
-    "connects to your network.</p>"
-    "</body></html>";
-
-static esp_err_t portal_root(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, PORTAL_HTML, HTTPD_RESP_USE_STRLEN);
-}
+/* --- Captive portal / web config (esp_http_server) ---
+ * portal_root (defined below, after url_decode) serves a DYNAMIC page that
+ * reflects the real connection state and mirrors the on-device 3-second
+ * settings screen (Wi-Fi + Renderer + Brightness + Save & apply / Reboot /
+ * Factory). The old static "not connected" page is gone: it hard-coded
+ * "not connected" on every request, so a happily connected board still told
+ * you it wasn't (the 2026-11-08 "says the opposite" bug).
+ */
 
 static esp_err_t portal_health(httpd_req_t *req)
 {
@@ -481,6 +469,236 @@ static void url_decode(char *s)
         }
     }
     *r = 0;
+}
+
+/* ===================== web config page (v6, 2026-11-08) =====================
+ * Dynamic mirror of the on-device 3-second settings screen. The page header
+ * / CSS live in PAGE_HEAD (a plain string, so the literal '%' in width:100%
+ * is harmless); the dynamic parts are snprintf'd on top. Everything that gets
+ * interpolated (ssid / password / host / url / ip) is html_escaped first. */
+static const char *PAGE_HEAD =
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>p4browser</title><style>"
+    ":root{color-scheme:dark}"
+    "body{font-family:system-ui,-apple-system,sans-serif;max-width:520px;margin:24px auto;padding:0 16px;background:#101418;color:#e6edf3;line-height:1.5}"
+    "h1{font-size:24px;margin:0 0 2px}"
+    ".status{border-radius:10px;padding:12px 14px;font-size:15px;margin:14px 0;border:1px solid}"
+    ".ok{background:#12261a;border-color:#2e7d32;color:#b9f6ca}"
+    ".no{background:#2a1414;border-color:#c62828;color:#ffb4ab}"
+    ".sub{color:#8b98a5;font-size:13px;margin:-8px 0 6px;word-break:break-all}"
+    "fieldset{border:1px solid #30363d;border-radius:10px;margin:16px 0;padding:12px 14px}"
+    "legend{color:#4FC3F7;font-weight:600;padding:0 6px;font-size:14px}"
+    "label{display:block;margin:10px 0 4px;color:#9aa4ad;font-size:13px}"
+    "input[type=text],input[type=password]{width:100%;box-sizing:border-box;background:#1e242b;border:1px solid #3a4750;border-radius:8px;color:#fff;padding:10px;font-size:16px}"
+    "input[type=range]{width:100%}"
+    ".row{display:flex;gap:10px;flex-wrap:wrap;margin:18px 0}"
+    ".row form{margin:0}"
+    "button{font-size:15px;padding:12px 18px;border:0;border-radius:10px;color:#fff;cursor:pointer}"
+    ".save{background:#2e7d32}.reboot{background:#37474f}.factory{background:#c62828}.screen{background:#1f6feb}"
+    ".bval{color:#fff;font-weight:600}.mut{color:#8b98a5;font-size:12px}"
+    "</style></head><body><h1>p4browser</h1>";
+
+/* HTML-escape src into dst (bounds-checked). */
+static void html_escape(char *dst, size_t dstlen, const char *src)
+{
+    size_t o = 0;
+    for (const char *p = src; *p && o + 8 < dstlen; p++) {
+        const char *rep = NULL;
+        switch (*p) {
+            case '&':  rep = "&amp;";   break;
+            case '<':  rep = "&lt;";    break;
+            case '>':  rep = "&gt;";    break;
+            case '"':  rep = "&quot;";  break;
+            case '\'': rep = "&#39;";   break;
+            default:   break;
+        }
+        if (rep) {
+            size_t rl = strlen(rep);
+            if (o + rl < dstlen) { memcpy(dst + o, rep, rl); o += rl; }
+        } else if (o + 1 < dstlen) {
+            dst[o++] = *p;
+        }
+    }
+    dst[o] = 0;
+}
+
+/* Pull one field (key=... up to & / EOL) out of a urlencoded body into out,
+ * then url_decode it in place. */
+static void form_get(const char *buf, const char *key, char *out, size_t outlen)
+{
+    char pat[24];
+    int pl = snprintf(pat, sizeof(pat), "%s=", key);
+    const char *s = strstr(buf, pat);
+    out[0] = 0;
+    if (!s) return;
+    s += pl;
+    size_t o = 0;
+    while (*s && *s != '&' && *s != '\r' && *s != '\n' && o + 1 < outlen) out[o++] = *s++;
+    out[o] = 0;
+    url_decode(out);
+}
+
+/* Spawned after /save when only the renderer changed: stop + restart the
+ * renderer (its cfg is re-loaded from NVS) so the new endpoint takes effect
+ * live, no reboot. Runs at prio 5 (above touch_task) so it is never starved
+ * mid-task-creation, the same way screen_worker runs. */
+static void save_apply_worker(void *arg)
+{
+    (void)arg;
+    remote_stop();
+    remote_start();
+    vTaskDelete(NULL);
+}
+
+/* POST /save — the web twin of settings.c's on_save. Persists Wi-Fi +
+ * renderer, then reboots if Wi-Fi changed, or live-restarts the renderer if
+ * only the renderer changed, else just "saved". */
+static esp_err_t save_handler(httpd_req_t *req)
+{
+    char buf[768];
+    int n = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (n <= 0) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv"); return ESP_FAIL; }
+    buf[n] = 0;
+
+    char ssid[64] = {0}, pass[64] = {0}, host[64] = {0}, port_s[16] = {0}, url[160] = {0};
+    form_get(buf, "ssid", ssid, sizeof(ssid));
+    form_get(buf, "pass", pass, sizeof(pass));
+    form_get(buf, "host", host, sizeof(host));
+    form_get(buf, "port", port_s, sizeof(port_s));
+    form_get(buf, "url",  url,  sizeof(url));
+
+    int port = atoi(port_s);
+    if (!host[0] || port < 1 || port > 65535) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid renderer host/port");
+        return ESP_OK;
+    }
+    if (!url[0]) strlcpy(url, CFG_DEFAULT_URL, sizeof(url));
+
+    /* current effective values (to diff against what we just stored) */
+    char ohost[64] = {0}; int oport = 0; char ourl[160] = {0};
+    remote_cfg_get(ohost, sizeof(ohost), &oport, ourl, sizeof(ourl));
+    char osid[64] = {0}, opass[64] = {0};
+    nvs_handle_t h;
+    if (nvs_open("wifi", NVS_READONLY, &h) == ESP_OK) {
+        size_t l = sizeof(osid); if (nvs_get_str(h, "ssid", osid, &l) != ESP_OK) osid[0] = 0;
+        l = sizeof(opass);        if (nvs_get_str(h, "pass", opass, &l) != ESP_OK) opass[0] = 0;
+        nvs_close(h);
+    }
+
+    if (nvs_open("wifi", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "ssid", ssid); nvs_set_str(h, "pass", pass);
+        nvs_commit(h); nvs_close(h);
+    }
+    if (nvs_open("remote", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_str(h, "host", host); nvs_set_u16(h, "port", (uint16_t)port);
+        nvs_set_str(h, "url", url); nvs_commit(h); nvs_close(h);
+    }
+
+    bool wifi_changed = (strcmp(osid, ssid) != 0) || (strcmp(opass, pass) != 0);
+    bool rend_changed = (strcmp(ohost, host) != 0) || (oport != port) || (strcmp(ourl, url) != 0);
+
+    httpd_resp_set_type(req, "text/html");
+    if (wifi_changed) {
+        ESP_LOGI(TAG, "web save: WiFi changed -> reboot");
+        httpd_resp_send(req, "<h1>Saved</h1><p>Wi-Fi changed &mdash; rebooting to connect&hellip;</p>", HTTPD_RESP_USE_STRLEN);
+        vTaskDelay(pdMS_TO_TICKS(800));
+        esp_restart();
+        return ESP_OK;
+    }
+    if (rend_changed) {
+        ESP_LOGI(TAG, "web save: renderer changed -> live restart");
+        xTaskCreate(save_apply_worker, "save", 8192, NULL, 5, NULL);
+        httpd_resp_send(req, "<h1>Saved</h1><p>Renderer updated &mdash; reconnecting (no reboot)&hellip;</p>", HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+    httpd_resp_send(req, "<h1>Saved</h1><p>Configuration saved.</p>", HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+/* GET / — the dynamic config page. Reports the REAL connection state and
+ * mirrors the on-device settings screen. Built into a static (heap) buffer:
+ * the httpd task stack (8 KB) is far too small for a ~3 KB frame on the
+ * stack, so it would stack-canary-crash (same reason as state_handler). */
+static esp_err_t portal_root(httpd_req_t *req)
+{
+    esp_netif_ip_info_t ii = {0};
+    bool connected = (s_sta_netif &&
+        esp_netif_get_ip_info(s_sta_netif, &ii) == ESP_OK && ii.ip.addr != 0);
+    char ip[16] = {0};
+    if (connected) esp_ip4addr_ntoa(&ii.ip, ip, sizeof(ip));
+
+    char ssid[64] = {0}, pass[64] = {0};
+    nvs_handle_t h;
+    if (nvs_open("wifi", NVS_READONLY, &h) == ESP_OK) {
+        size_t l = sizeof(ssid); if (nvs_get_str(h, "ssid", ssid, &l) != ESP_OK) ssid[0] = 0;
+        l = sizeof(pass);        if (nvs_get_str(h, "pass", pass, &l) != ESP_OK) pass[0] = 0;
+        nvs_close(h);
+    }
+    char host[64] = {0}, url[160] = {0}; int port = 0;
+    remote_cfg_get(host, sizeof(host), &port, url, sizeof(url));
+    int bright = backlight_get();
+
+    char e_ssid[128] = {0}, e_pass[128] = {0}, e_host[128] = {0},
+         e_url[320] = {0}, e_ip[32] = {0};
+    html_escape(e_ssid, sizeof(e_ssid), ssid);
+    html_escape(e_pass, sizeof(e_pass), pass);
+    html_escape(e_host, sizeof(e_host), host);
+    html_escape(e_url, sizeof(e_url), url);
+    html_escape(e_ip,   sizeof(e_ip),   ip);
+
+    static char page[5120];
+    size_t off = 0;
+    { size_t l = strlen(PAGE_HEAD); memcpy(page, PAGE_HEAD, l); off = l; }
+
+    if (connected) {
+        off += snprintf(page + off, sizeof(page) - off,
+            "<div class=\"status ok\">&#9679; Connected &mdash; SSID <b>%s</b> &middot; IP %s</div>"
+            "<div class=\"sub\">Renderer %s:%d &rarr; %s</div>",
+            e_ssid[0] ? e_ssid : "(none)", e_ip, e_host, port, e_url);
+    } else if (ssid[0]) {
+        off += snprintf(page + off, sizeof(page) - off,
+            "<div class=\"status no\">&#9679; No link yet &mdash; retrying <b>%s</b></div>"
+            "<div class=\"sub\">Check the router, or fix the Wi-Fi details below &middot; Renderer %s:%d</div>",
+            e_ssid, e_host, port);
+    } else {
+        off += snprintf(page + off, sizeof(page) - off,
+            "<div class=\"status no\">&#9679; Not configured &mdash; set your Wi-Fi below</div>"
+            "<div class=\"sub\">Or join SoftAP <b>p4browser</b> (password <b>p4browser1</b>) &rarr; http://192.168.4.1 &middot; Renderer %s:%d</div>",
+            e_host, port);
+    }
+
+    off += snprintf(page + off, sizeof(page) - off,
+        "<form method=\"post\" action=\"/save\">"
+        "<fieldset><legend>Wi-Fi</legend>"
+        "<label>SSID</label><input type=\"text\" name=\"ssid\" value=\"%s\">"
+        "<label>Password</label><input type=\"password\" name=\"pass\" value=\"%s\">"
+        "</fieldset>"
+        "<fieldset><legend>Renderer (NAS)</legend>"
+        "<label>Host</label><input type=\"text\" name=\"host\" value=\"%s\">"
+        "<label>Port</label><input type=\"text\" name=\"port\" value=\"%d\">"
+        "<label>Dashboard URL</label><input type=\"text\" name=\"url\" value=\"%s\">"
+        "</fieldset>"
+        "<fieldset><legend>Display</legend>"
+        "<label>Brightness <span class=\"bval\" id=\"bv\">%d %%</span></label>"
+        "<input type=\"range\" min=\"0\" max=\"100\" value=\"%d\" "
+        "oninput=\"document.getElementById('bv').textContent=this.value+' %%';fetch('/brightness?level='+this.value)\">"
+        "<div class=\"mut\">Applied live as you drag (same as the board slider).</div>"
+        "</fieldset>"
+        "<div class=\"row\"><button type=\"submit\" class=\"save\">Save &amp; apply</button></div>"
+        "</form>"
+        "<div class=\"row\">"
+        "<form method=\"get\" action=\"/reboot\"><button class=\"reboot\">Reboot</button></form>"
+        "<form method=\"get\" action=\"/screen?cfg=1\"><button class=\"screen\">On-device settings</button></form>"
+        "<form method=\"get\" action=\"/factory\" onsubmit=\"return confirm('Factory reset wipes Wi-Fi + renderer config and reboots. Continue?')\">"
+        "<button class=\"factory\">Factory reset</button></form>"
+        "</div>"
+        "<div class=\"mut\">Save &amp; apply reboots if Wi-Fi changed, or reconnects the renderer live if only the renderer changed &mdash; exactly like the on-device screen.</div>"
+        "</body></html>",
+        e_ssid, e_pass, e_host, port, e_url, bright, bright);
+
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, page, off);
 }
 
 static esp_err_t portal_config(httpd_req_t *req)
@@ -655,6 +873,77 @@ static esp_err_t factory_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* --- App OTA: receive a new image over HTTP into the other OTA slot ---
+ * The flash is A/B (ota_0 + ota_1 + otadata). POST /ota streams the uploaded
+ * .bin into the NON-running slot, verifies it (esp_ota_end), flips the boot
+ * pointer (esp_ota_set_boot_partition) and reboots. Safe against a mid-write
+ * power loss: the running slot is never touched, and the boot pointer only
+ * changes after a complete, verified write, so a corrupt/interrupted upload
+ * leaves the board booting the last-good app. app_main calls
+ * esp_ota_mark_app_valid_cancel_rollback() so the new app sticks (no rollback).
+ *
+ * A ~3 MB image takes ~1-3 min to write (SPI-flash erase dominates). The body
+ * is streamed in small chunks so the 8 KB httpd stack stays well within limits
+ * and the image is never buffered whole in RAM. */
+static esp_err_t ota_handler(httpd_req_t *req)
+{
+    char lenbuf[32];
+    if (httpd_req_get_hdr_value_str(req, "Content-Length", lenbuf, sizeof(lenbuf)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing Content-Length");
+        return ESP_FAIL;
+    }
+    size_t total = (size_t)strtoul(lenbuf, NULL, 10);
+    const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+    if (!part || total == 0 || total >= part->size) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "bad image size (must be < slot size)");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "OTA: writing %u bytes to %s @ 0x%x ...",
+             (unsigned)total, part->label, (unsigned)part->address);
+    esp_ota_handle_t ota_handle;
+    if (esp_ota_begin(part, total, &ota_handle) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ota_begin failed");
+        return ESP_FAIL;
+    }
+    char chunk[2048];
+    size_t done = 0;
+    bool ok = true;
+    while (done < total) {
+        size_t want = total - done;
+        if (want > sizeof(chunk)) want = sizeof(chunk);
+        int r = httpd_req_recv(req, chunk, want);
+        if (r <= 0) {
+            ESP_LOGE(TAG, "OTA: recv error at %u/%u", (unsigned)done, (unsigned)total);
+            ok = false;
+            break;
+        }
+        if (esp_ota_write(ota_handle, chunk, (size_t)r) != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: flash write error at %u", (unsigned)done);
+            ok = false;
+            break;
+        }
+        done += (size_t)r;
+        if ((done & 0x1FFFFF) == 0) /* ~2 MB progress ticks */
+            ESP_LOGI(TAG, "OTA: %u/%u bytes written", (unsigned)done, (unsigned)total);
+    }
+    if (ok && esp_ota_end(ota_handle) != ESP_OK) {
+        ESP_LOGE(TAG, "OTA: esp_ota_end failed (image verify mismatch)");
+        ok = false;
+    }
+    if (!ok) {
+        esp_ota_abort(ota_handle);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTA write failed");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "OTA: image verified, switching boot to %s and rebooting", part->label);
+    esp_ota_set_boot_partition(part);
+    httpd_resp_sendstr(req, "OTA image verified; rebooting into new app...\n");
+    vTaskDelay(pdMS_TO_TICKS(200)); /* let the response flush before the reboot */
+    esp_restart();
+    return ESP_OK; /* not reached */
+}
+
 static esp_err_t start_portal(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -675,6 +964,8 @@ static esp_err_t start_portal(void)
     u.uri = "/health";  u.method = HTTP_GET; u.handler = portal_health; httpd_register_uri_handler(srv, &u);
     memset(&u, 0, sizeof(u));
     u.uri = "/config";  u.method = HTTP_POST; u.handler = portal_config; httpd_register_uri_handler(srv, &u);
+    memset(&u, 0, sizeof(u));
+    u.uri = "/save";    u.method = HTTP_POST; u.handler = save_handler;  httpd_register_uri_handler(srv, &u);
     /* v3: navigation endpoint — works both in portal-AP and LAN-STA modes */
     memset(&u, 0, sizeof(u));
     u.uri = "/url";     u.method = HTTP_GET; u.handler = url_navigate;  httpd_register_uri_handler(srv, &u);
@@ -691,7 +982,9 @@ static esp_err_t start_portal(void)
     u.uri = "/reboot";     u.method = HTTP_GET; u.handler = reboot_handler;     httpd_register_uri_handler(srv, &u);
     memset(&u, 0, sizeof(u));
     u.uri = "/factory";    u.method = HTTP_GET; u.handler = factory_handler;    httpd_register_uri_handler(srv, &u);
-    ESP_LOGI(TAG, "http server listening on :80 (portal + /url + /state + /fill + /brightness + /screen + /reboot + /factory)");
+    memset(&u, 0, sizeof(u));
+    u.uri = "/ota";        u.method = HTTP_POST; u.handler = ota_handler;       httpd_register_uri_handler(srv, &u);
+    ESP_LOGI(TAG, "http server listening on :80 (portal + /url + /state + /fill + /brightness + /screen + /reboot + /factory + /ota)");
     return ESP_OK;
 }
 
@@ -1027,6 +1320,12 @@ void app_main(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 
     nvs_flash_init(); /* idempotent; needed for wifi NVS + esp_wifi_remote */
+
+    /* If we booted as the result of an OTA update, confirm the new image so it
+     * sticks. Returns an error when this boot wasn't an OTA update (normal
+     * serial/first flash) — ignore it. Without this, a fresh OTA app rolls back
+     * to the previous slot after 3 reboots. */
+    esp_ota_mark_app_valid_cancel_rollback();
 
     init_backlight();
     power_dsi_phy();

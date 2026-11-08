@@ -278,7 +278,12 @@ static lv_obj_t *add_button(lv_obj_t *parent, int x, const char *text, uint32_t 
 {
     lv_obj_t *b = lv_button_create(parent);
     lv_obj_set_size(b, 290, 80);
-    lv_obj_align(b, LV_ALIGN_BOTTOM_LEFT, x, 60);
+    /* BOTTOM align y-ofs is ADDITIVE in +y (DOWN): lv_area_align sets
+     * y1 = (base_h - obj_h) + ofs_y, so a POSITIVE ofs_y pushes the button
+     * BELOW the screen edge (the "sunk buttons" bug: +40 then +60 each cut
+     * the row off the bottom). Negative lifts it into view; -60 leaves a
+     * clean 60 px margin under the button row. */
+    lv_obj_align(b, LV_ALIGN_BOTTOM_LEFT, x, -60);
     lv_obj_set_style_radius(b, 12, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(bg), 0);
     lv_obj_set_style_border_width(b, 0, 0);
@@ -376,7 +381,10 @@ static void build_settings_screen(void)
     /* shared keyboard, shown while a field is focused (sits above the bar) */
     s_kb = lv_keyboard_create(s_scr);
     lv_obj_set_size(s_kb, 1200, 440);
-    lv_obj_align(s_kb, LV_ALIGN_BOTTOM_LEFT, 40, 148);
+    /* -148 (NOT +148): BOTTOM align y-ofs is additive in +y (down), so +148
+     * clipped the keyboard's bottom third below the screen edge. -148 lifts
+     * it so its bottom sits just above the button bar. */
+    lv_obj_align(s_kb, LV_ALIGN_BOTTOM_LEFT, 40, -148);
     lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
 }
 
