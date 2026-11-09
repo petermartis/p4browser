@@ -92,11 +92,42 @@ injects. Per-event log line: `[TOUCH-IN] cdp=Nms` — the CDP injection cost
   `pong_age` — if the board is connected but `pong_age` grows, the WS is
   half-dead (usually the board-side lwIP, see troubleshooting).
 
+## Control HTTP server (no WS client needed)
+
+A second, plain-HTTP server runs on `RENDERER_CONTROL_PORT` (default **5052**,
+bound `0.0.0.0`) so the pinned page can be re-fetched or re-pointed with one
+`curl` — no board reboot, no WebSocket client. This is what the board's
+**Reload dashboard** button (on the device's settings screen *and* the port-80
+web config page) calls, and what a Homey flow can call right after a dashboard
+edit:
+
+| Endpoint | Effect |
+|---|---|
+| `GET /reload` | Re-fetch the pinned page fresh from Homey, then the new frames flow to the board in ~2 s — no reboot, no Chrome restart. |
+| `GET /nav?u=<url>` | Point the board's page at a different URL (e.g. a custom control page). |
+| `GET /status` | What it's currently rendering + frames sent + connected-client count. |
+
+Returns JSON (`{"ok":true,"url":...}` on success, `{"ok":false,"msg":...}` on
+failure) and `503` when no board is connected (no active page). Log lines:
+`[renderer] reload -> <url>` and `[renderer] control HTTP on :5052 (...)`.
+
+```sh
+curl http://<renderer-host>:5052/reload
+curl 'http://<renderer-host>:5052/nav?u=http://<host>:8080/custom.html'
+curl http://<renderer-host>:5052/status
+```
+
+`/reload` uses the same `robustGoto` path as connect/navigate (so it survives
+Homey's SPA redirect race) and then resets the change fingerprint, so the fresh
+frame is sent immediately. It does **not** restart Chrome — there is no blank
+flash, the existing page just re-navigates.
+
 ## Environment variables
 
 | Var | Default | Production | Meaning |
 |---|---|---|---|
 | `PORT` | 9100 | 9100 | WS listen port (board connects here) |
+| `RENDERER_CONTROL_PORT` | 5052 | 5052 | Plain-HTTP control port — `/reload` `/nav` `/status` (board's Reload button) |
 | `PIN_URL` | — | `http://192.168.3.5:5050/viewer.html` | Fixed page to render (overrides board-supplied URL) |
 | `RENDERER_WIDTH` / `RENDERER_HEIGHT` | 1280 / 800 | 1280 / 800 | Chrome window + capture clip (landscape standard) |
 | `RENDERER_FPS` | 8 | 8 | Capture slot rate |

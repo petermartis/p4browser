@@ -1,9 +1,10 @@
 # p4browser
 
 A full web-rendering browser for the **Guition JC8012P4A1** (ESP32-P4, 10.1"
-800×1280 MIPI-DSI touchscreen). A headless Chromium running on a network
-machine (a NAS in this deployment) renders any web page — in this project, the
-**Homey Pro Dashboard Studio** home-automation dashboard — and streams the
+800×1280 MIPI-DSI touchscreen). A headless Chromium running on any always-on
+Linux box — a Synology NAS in this deployment, but a **Raspberry Pi** or any
+Linux server works just as well — renders any web page (in this project, the
+**Homey Pro Dashboard Studio** home-automation dashboard) and streams the
 frames over the LAN as JPEGs to the ESP32-P4, which decodes them in hardware
 and drives the DSI panel. Touch input on the board travels back over the same
 WebSocket and is injected into the page via Chrome DevTools Protocol, so the
@@ -11,15 +12,15 @@ dashboard's own controls (switches, sliders, widgets) work directly on the
 wall display.
 
 ```
-   ┌────────────── NAS (Synology DSM) ──────────────┐        ┌────────────────────── Board ──────────────────────┐
-   │  headless Chrome 1280×800                      │  WS    │  remote.c                                          │
-   │  renderer.js: capture → diff → JPEG q70  ──────┼───────┼─▶ HW JPEG decode → RGB888 1280×800                │
-   │         ▲ touch injected via CDP (CDP :9222)   │  :9100 │         │  RGB888→RGB565 + 90° rotate (~150ms)    │
-   │  puppeteer-core, ws, node 22                   │ ◀──────┼─── touch JSON (GSL3680, 5ms poll)                │
-   │  systemd user service (watchdog)               │        │  DSI double-buffered fb (800×1280 RGB565)        │
-   └────────────────────────────────────────────────┘        │  LVGL 9 (local UI: config screen, gestures)      │
-                                                             │  HTTP server :80 (/state /config /url /brightness)│
-                                                             └──────────────────────────────────────────────────┘
+   ┌──────────── Renderer: NAS / Pi ─────────────┐        ┌────────────────────── Board ──────────────────────┐
+   │  headless Chrome 1280×800                    │  WS    │  remote.c                                          │
+   │  renderer.js: capture → diff → JPEG q70  ────┼───────┼─▶ HW JPEG decode → RGB888 1280×800                │
+   │         ▲ touch injected via CDP (CDP :9222) │  :9100 │         │  RGB888→RGB565 + 90° rotate (~150ms)    │
+   │  control HTTP :5052 (/reload /nav /status)   │ ◀──────┼─── touch JSON (GSL3680, 5ms poll)                │
+   │  puppeteer-core, ws, node 22                 │        │  DSI double-buffered fb (800×1280 RGB565)        │
+   │  systemd user service (watchdog)             │        │  LVGL 9 (local UI: config screen, gestures)      │
+   └──────────────────────────────────────────────┘        │  HTTP server :80 (/state /config /url /brightness)│
+                                                            └──────────────────────────────────────────────────┘
 ```
 
 ## Repository layout
@@ -29,7 +30,7 @@ wall display.
 | `firmware/` | ESP-IDF 5.5 project for the JC8012P4A1 (LVGL 9.3, esp_hosted C6 Wi-Fi, HW JPEG) |
 | `firmware/main/` | `browser.c` (display + local text browser + config screen wiring), `remote.c` (remote render client + touch), `settings.c` (config screen), `main.c` (HTTP server, app_main, DSI init), `p4_jc8012.c` (board init sequence) |
 | `firmware/tools/` | Build wrappers (`idf55`), flash scripts, `macssh.py` (remote flashing helper) |
-| `renderer/` | Node.js renderer: `renderer.js` (capture/diff/send loop + CDP touch injection), `dashboard-server.js` (optional Homey API bridge for a simple toggle dashboard), systemd service template |
+| `renderer/` | Node.js renderer: `renderer.js` (capture/diff/send loop + CDP touch injection + plain-HTTP control server on :5052 for `/reload` `/nav` `/status`), `dashboard-server.js` (optional Homey API bridge for a simple toggle dashboard), `renderer_watchdog.py` (respawning supervisor), `systemd/` service templates for a NAS and a Raspberry Pi |
 | `docs/` | Architecture, firmware, renderer, build/flash, troubleshooting, and the original design documents |
 
 ## Quick start
@@ -54,13 +55,15 @@ esptool --chip esp32p4 -b 460800 --before default_reset --after hard_reset \
   0x10000 build/p4browser.bin
 ```
 
-**Renderer** (on the LAN machine, Node 22+):
+**Renderer** (on the LAN machine, Node 22+ — a Synology NAS, a Raspberry Pi,
+or any always-on Linux box):
 
 ```sh
 cd renderer
 npm install
-python3 fetch_chrome.py      # downloads chrome-headless-shell
-node renderer.js             # or run as a systemd user service (see docs/build-and-flash.md)
+python3 fetch_chrome.py      # downloads chrome-headless-shell (skip on a Pi —
+                             # use the system Chromium; see docs/build-and-flash.md)
+node renderer.js             # or run as a systemd user service (NAS or Pi)
 ```
 
 Point the renderer at your dashboard URL (`RENDERER_URL` / the `connect`
@@ -73,8 +76,8 @@ Full instructions: [`docs/build-and-flash.md`](docs/build-and-flash.md).
 
 - [Architecture](docs/architecture.md) — the two rendering modes, the frame pipeline, the touch pipeline, latency budget
 - [Firmware](docs/firmware.md) — file-by-file tour, display/rotation, config screen & gestures, `/state` reference
-- [Renderer](docs/renderer.md) — capture loop, change-detection, animation guard & input bypass, self-heal, env vars
-- [Build & flash](docs/build-and-flash.md) — firmware build/flash, renderer deployment, systemd service, DSM notes
+- [Renderer](docs/renderer.md) — capture loop, change-detection, animation guard & input bypass, self-heal, the plain-HTTP control server (`/reload` `/nav` `/status`), env vars
+- [Build & flash](docs/build-and-flash.md) — firmware build/flash, renderer deployment on a NAS **or a Raspberry Pi**, systemd services
 - [Troubleshooting](docs/troubleshooting.md) — the hard-won lessons: DSI init, lwIP animation floods, tap-latency diagnosis, crash forensics
 - [Design history](docs/assignment.md) and [Remote-render plan](docs/renderer-plan.md) — the original handoff documents
 
@@ -86,6 +89,9 @@ Full instructions: [`docs/build-and-flash.md`](docs/build-and-flash.md).
 - The physical panel is **portrait 800×1280**; the standard layout is
   **landscape 1280×800** — the video pipeline and LVGL both rotate 90°
   (see `docs/firmware.md` §Rotation).
+- The renderer host needs Node 22+ and a headless Chromium. Any always-on
+  Linux box works — see [`docs/build-and-flash.md`](docs/build-and-flash.md)
+  §Raspberry Pi for a no-NAS deployment.
 
 ## License
 

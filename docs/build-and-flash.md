@@ -96,6 +96,64 @@ systemctl --user enable --now nas-renderer
 - The unit runs the watchdog (`renderer_watchdog.py`), which respawns node;
   `Restart=always` covers the watchdog itself.
 
+### Run on a Raspberry Pi (no NAS needed)
+
+The renderer is just a Node.js + headless Chromium process — it runs on **any**
+always-on Linux box. A **Raspberry Pi** (4 or 5, 4 GB+ RAM recommended) is a
+great fit and needs no NAS. `renderer_watchdog.py` is already host-agnostic: it
+reads `NODE`, `SCRIPT`, `CHROME_PATH` and `PORT` from the environment and only
+applies the NAS-specific lib/fontconfig overrides when those paths exist (a Pi
+skips them and uses system defaults).
+
+**1. Raspberry Pi OS** (64-bit bookworm) — install Node 22 + system Chromium:
+
+```sh
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt update
+sudo apt install -y nodejs chromium python3
+```
+
+**2. Clone the renderer and install its npm deps:**
+
+```sh
+git clone https://github.com/petermartis/p4browser.git ~/p4browser
+cd ~/p4browser/renderer
+npm install                 # puppeteer-core, ws
+```
+
+No `fetch_chrome.py` needed — you use the system Chromium at `/usr/bin/chromium`.
+
+**3. Install the systemd user service:**
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp renderer/systemd/pi-renderer.service ~/.config/systemd/user/
+# edit PIN_URL (and ExecStart/SCRIPT if you didn't clone to ~/p4browser)
+systemctl --user daemon-reload
+loginctl enable-linger $USER        # keep the user service alive after logout/boot
+systemctl --user enable --now pi-renderer
+```
+
+**4. Point the board at the Pi** (board config screen: renderer host = the Pi's
+IP, port 9100).
+
+**Verify:**
+
+```sh
+curl http://<pi-ip>:5052/status        # control server: what it's rendering
+journalctl --user -u pi-renderer -f    # renderer + watchdog logs
+```
+
+**Pi notes:**
+- The 2 GB Pi5 runs it but is tight — a sustained-animating dashboard plus a
+  page reload can exhaust RAM (a blank flash). 4 GB+ is comfortable; the code
+  already caps Chrome to avoid the runaway that pegged the 2 GB model.
+- `journalctl --user` works on Raspberry Pi OS (unlike DSM, where you must use
+  `RENDERER_LOG`).
+- Same env vars as the NAS deployment (see `renderer.md` §Environment
+  variables); the Pi unit additionally sets `CHROME_PATH=/usr/bin/chromium`,
+  `NODE` and `SCRIPT`.
+
 ## Configuration (board UI)
 
 1. Long-press the screen for 3 s → config screen.

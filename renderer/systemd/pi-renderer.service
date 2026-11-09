@@ -1,0 +1,46 @@
+[Unit]
+Description=p4browser remote renderer (Raspberry Pi)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# --- host-specific: point these at your clone + binaries (EDIT ME) ---
+# Node 22 binary and the renderer script (default = repo cloned to ~/p4browser).
+Environment="NODE=/usr/bin/node"
+Environment="SCRIPT=/home/pi/p4browser/renderer/renderer.js"
+# System Chromium (Raspberry Pi OS). `sudo apt install chromium` puts this at
+# /usr/bin/chromium. The watchdog passes CHROME_PATH through to renderer.js.
+Environment="CHROME_PATH=/usr/bin/chromium"
+# --- renderer behaviour (same as the NAS deployment) ---
+Environment="PORT=9100"
+# Plain one-shot capture loop (proven). 1 = experimental event-driven screencast.
+Environment="RENDERER_SCREENCAST=0"
+# 8 fps = ~125ms tap-to-update; the change-gate keeps traffic near zero on a
+# static dashboard.
+Environment="RENDERER_FPS=8"
+# Sustained-animation send cap (ms). 1000 = 1fps while a page changes every
+# slot; discrete changes still send at full 8fps. A *ticking* dashboard trips
+# this — the renderer's 3s input-priority window keeps taps fast.
+Environment="RENDERER_MIN_SEND_GAP_MS=1000"
+Environment="RENDERER_HEARTBEAT_MS=5000"
+# EDIT: pin the page to render (board's NVS URL is ignored when set).
+Environment="PIN_URL=http://<homey-ip>:5050/viewer.html"
+# Board asks for q=30; 70 keeps text crisp on the LCD.
+Environment="RENDERER_QUALITY=70"
+# Plain-HTTP control server (board's Reload button + curl /reload). Port 5052.
+Environment="RENDERER_CONTROL_PORT=5052"
+# Logs (journalctl --user works on Pi OS, unlike DSM — these are optional).
+Environment="RENDERER_LOG=/home/pi/renderer.log"
+Environment="WATCHDOG_LOG=/home/pi/watchdog.log"
+# EDIT: point at your renderer dir (matches the repo clone above).
+ExecStart=/usr/bin/python3 /home/pi/p4browser/renderer/renderer_watchdog.py
+Restart=always
+RestartSec=2
+KillMode=control-group
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

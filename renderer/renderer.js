@@ -281,6 +281,26 @@ class Client {
     }
   }
 
+  // On-demand reload: re-fetch the pinned page (fresh from Homey) WITHOUT
+  // restarting Chrome — so a dashboard change shows up on the board with no
+  // board reboot. Uses the same robustGoto path as connect/navigate, so it
+  // handles the Homey SPA redirect race. Falls back to the current URL when
+  // no PIN_URL is set.
+  async reload() {
+    if (!this.page) return;
+    const url = PIN_URL || this.page.url();
+    console.log(`[renderer] reload -> ${url}`);
+    try {
+      await this.robustGoto(url);
+      this.lastFp = null;
+      await this.send({ type: 'nav', ok: true, url: this.page.url(),
+        title: await this.page.title().catch(() => '') });
+      console.log(`[renderer] reload done: ${this.page.url()}`);
+    } catch (e) {
+      await this.send({ type: 'nav', ok: false, url, msg: String(e && e.message || e) });
+    }
+  }
+
   startLoop() {
     if (this.loop) return;
     console.log(`[renderer] startLoop: SCREENCAST=${JSON.stringify(process.env.RENDERER_SCREENCAST)} fps=${this.fps} page=${!!this.page} url=${this.page && this.page.url()}`);
@@ -695,6 +715,7 @@ wss.on('connection', (ws) => {
           break;
         }
         case 'navigate': await c.navigate(msg.url); break;
+        case 'reload':   await c.reload(); break;
         case 'input':    await c.input(msg); break;
         case 'ping':
           c.send({ type: 'pong' });
@@ -986,4 +1007,40 @@ setInterval(() => {
 // here used to crash the handler (TypeError: c.shutdown is not a function)
 // before process.exit() could run.
 process.on('SIGTERM', async () => { for (const c of [...clients]) { try { await c.shutdown(); } catch (_) {} } process.exit(0); });
+
+// On-demand control over plain HTTP — refresh the board's page with one curl,
+// no board reboot, no WS client needed. A Homey flow (or me) hits /reload
+// after a dashboard edit; the renderer re-fetches the pinned page and the
+// fresh frames flow to the board.
+//   curl http://<nas>:5052/reload          -> re-fetch the pinned page
+//   curl 'http://<nas>:5052/nav?u=URL'     -> point the board's page at URL
+//   curl http://<nas>:5052/status          -> what it's rendering + frame count
+const CONTROL_PORT = parseInt(process.env.RENDERER_CONTROL_PORT, 10) || 5052;
+try {
+  const cthttp = require('http');
+  cthttp.createServer((req, res) => {
+    let u; try { u = new URL(req.url, 'http://localhost'); } catch (_) { res.statusCode = 400; return res.end('bad url'); }
+    res.setHeader('Content-Type', 'application/json');
+    const finish = (code, obj) => { res.statusCode = code; res.end(JSON.stringify(obj)); };
+    const a = active;
+    if (!a || !a.page) return finish(503, { ok: false, msg: 'no active page (board not connected)' });
+    if (u.pathname === '/reload') {
+      a.reload().then(() => finish(200, { ok: true, url: a.page.url() }))
+                .catch(e => finish(500, { ok: false, msg: String(e && e.message || e) }));
+    } else if (u.pathname === '/nav') {
+      const target = u.searchParams.get('u');
+      if (!target) return finish(400, { ok: false, msg: 'usage: /nav?u=<url>' });
+      a.navigate(target).then(() => finish(200, { ok: true, url: a.page.url() }))
+                        .catch(e => finish(500, { ok: false, msg: String(e && e.message || e) }));
+    } else if (u.pathname === '/status') {
+      return finish(200, { ok: true, url: a.page.url(),
+        framesSent: a.framesSent || 0, clients: clients.size, pinUrl: PIN_URL || null });
+    } else {
+      return finish(404, { ok: false, msg: 'endpoints: /reload, /nav?u=<url>, /status' });
+    }
+  }).listen(CONTROL_PORT, '0.0.0.0', () =>
+    console.log(`[renderer] control HTTP on :${CONTROL_PORT} (/reload /nav /status)`));
+} catch (e) {
+  console.log(`[renderer] control HTTP failed to start: ${e && e.message}`);
+}
 process.on('SIGINT',  async () => { for (const c of [...clients]) { try { await c.shutdown(); } catch (_) {} } process.exit(0); });
