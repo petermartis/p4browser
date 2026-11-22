@@ -30,10 +30,17 @@ wall display.
 | `firmware/` | ESP-IDF 5.5 project for the JC8012P4A1 (LVGL 9.3, esp_hosted C6 Wi-Fi, HW JPEG) |
 | `firmware/main/` | `browser.c` (display + local text browser + config screen wiring), `remote.c` (remote render client + touch), `settings.c` (config screen), `main.c` (HTTP server, app_main, DSI init), `p4_jc8012.c` (board init sequence) |
 | `firmware/tools/` | Build wrappers (`idf55`), flash scripts, `macssh.py` (remote flashing helper) |
+| `firmware/prebuilt/` | Latest prebuilt `p4browser.bin` (+ `SHA256`, `VERSION`) for flashing without an ESP-IDF toolchain |
 | `renderer/` | Node.js renderer: `renderer.js` (capture/diff/send loop + CDP touch injection + plain-HTTP control server on :5052 for `/reload` `/nav` `/status`), `dashboard-server.js` (optional Homey API bridge for a simple toggle dashboard), `renderer_watchdog.py` (respawning supervisor), `systemd/` service templates for a NAS and a Raspberry Pi |
 | `docs/` | Architecture, firmware, renderer, build/flash, troubleshooting, and the original design documents |
 
 ## Quick start
+
+> **No ESP-IDF toolchain?** Flash the prebuilt image in
+> [`firmware/prebuilt/p4browser.bin`](firmware/prebuilt/p4browser.bin) with the
+> `esptool` command below (check `firmware/prebuilt/SHA256` first). Once a board
+> is up, later firmware updates ship over the LAN: `curl -X POST
+> --data-binary @p4browser.bin http://<board>/ota`.
 
 **Firmware** (build on any machine with ESP-IDF 5.5; this project was built
 on a Synology NAS):
@@ -71,6 +78,24 @@ message from the board) and open the board's config screen
 (3-second long-press) to set the renderer host/port and Wi-Fi.
 
 Full instructions: [`docs/build-and-flash.md`](docs/build-and-flash.md).
+
+## Reliability
+
+The board and renderer are built to survive a renderer host (or the whole NAS)
+rebooting underneath them:
+
+- **Boot config fallback.** If no frame reaches the board within ~30 s of boot,
+  it shows the config screen with the right instruction (no Wi-Fi → set SSID;
+  Wi-Fi but no stream → check the renderer host/port) instead of a black panel,
+  and resumes video the instant frames return. See
+  [`docs/troubleshooting.md`](docs/troubleshooting.md) §Board black/garbled after
+  a NAS reboot.
+- **Renderer autostart after a host reboot.** systemd user units + linger are
+  *necessary but not sufficient* on Synology DSM — the reliable mechanism is a
+  root `rc.d` boot trigger that starts the user services explicitly. Make the
+  volatile DSM journal persistent so a future boot is diagnosable.
+- **Socket watchdogs + self-heal** keep a half-dead WebSocket or a hung page
+  from wedging the display (see [docs/troubleshooting.md](docs/troubleshooting.md)).
 
 ## Documentation
 

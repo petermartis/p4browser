@@ -109,6 +109,11 @@ static lv_obj_t                *s_xhair     = NULL;   /* crosshair at last tap (
 static uint32_t                 s_clicks    = 0;      /* native LVGL click count */
 static bool     s_touch_present = false;   /* I2C probe succeeded */
 static int      s_touch_inits   = 0;       /* successful driver inits */
+/* Set when the long-press gesture opens settings: the finger is still down,
+ * so LVGL's indev would register a press at the hold position and, on release,
+ * a click on whatever sits under it (e.g. Back — closing the screen we just
+ * opened). Swallow input until the finger is fully up, then allow fresh taps. */
+static volatile bool  s_indev_swallow     = false;
 
 /* I2C bus mutex — SHARED with the GSL3680 driver (declared extern there).
  * The touch I2C bus is in blocking mode (no per-transaction timeout), so any
@@ -749,61 +754,75 @@ static void build_ui(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
     lv_obj_set_style_text_color(scr, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
 
+    /* Boot/connect screen layout note: the panel is 800x1280 PORTRAIT, but the
+     * old landscape (1280-wide, top-left) positions made the title, url, body and
+     * touch labels stack on top of one another once the display driver rotated
+     * them — the "overlapping strings" the user saw. Everything visible here is
+     * now centre-aligned (orientation-robust) and the debug labels (url bar, tap
+     * counter, test button) start hidden. remote_ui_ready()/settings still hide
+     * all of this the moment video or the config screen takes over. */
+
     /* title bar */
     s_title_lbl = lv_label_create(scr);
-    lv_obj_set_width(s_title_lbl, 1280 - 40);
+    lv_obj_set_width(s_title_lbl, 720);
     lv_label_set_long_mode(s_title_lbl, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_font(s_title_lbl, &lv_font_montserrat_40, LV_PART_MAIN);
-    lv_obj_align(s_title_lbl, LV_ALIGN_TOP_LEFT, 20, 20);
+    lv_obj_set_style_text_align(s_title_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(s_title_lbl, LV_ALIGN_CENTER, 0, -70);
     lv_obj_set_style_text_color(s_title_lbl, lv_color_hex(0x4FC3F7), LV_PART_MAIN);
 
-    /* url bar */
+    /* url bar — debug only; hidden (kept for the legacy text-browser path) */
     s_url_lbl = lv_label_create(scr);
-    lv_obj_set_width(s_url_lbl, 1280 - 40);
+    lv_obj_set_width(s_url_lbl, 720);
     lv_label_set_long_mode(s_url_lbl, LV_LABEL_LONG_MODE_WRAP);
     lv_obj_set_style_text_font(s_url_lbl, &lv_font_montserrat_16, LV_PART_MAIN);
-    lv_obj_align(s_url_lbl, LV_ALIGN_TOP_LEFT, 20, 100);
+    lv_obj_set_style_text_align(s_url_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(s_url_lbl, LV_ALIGN_CENTER, 0, 150);
     lv_obj_set_style_text_color(s_url_lbl, lv_color_hex(0x9E9E9E), LV_PART_MAIN);
+    lv_obj_add_flag(s_url_lbl, LV_OBJ_FLAG_HIDDEN);
 
-    /* scrollable body container (shrink to leave a bottom control strip) */
+    /* scrollable body container — centred block holding the status line */
     s_body = lv_obj_create(scr);
-    lv_obj_set_size(s_body, 1280, 800 - 260);
-    lv_obj_align(s_body, LV_ALIGN_TOP_LEFT, 0, 140);
+    lv_obj_set_size(s_body, 760, 360);
+    lv_obj_align(s_body, LV_ALIGN_CENTER, 0, 40);
     lv_obj_set_style_bg_color(s_body, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_body, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_body, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(s_body, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(s_body, 0, LV_PART_MAIN);
-    lv_obj_set_scrollbar_mode(s_body, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_remove_flag(s_body, LV_OBJ_FLAG_SCROLL_WITH_ARROW);
+    lv_obj_set_scrollbar_mode(s_body, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_remove_flag(s_body, LV_OBJ_FLAG_SCROLLABLE);
 
     /* text label inside the container */
     s_body_lbl = lv_label_create(s_body);
-    lv_obj_set_width(s_body_lbl, 1280 - 40);
+    lv_obj_set_width(s_body_lbl, 720);
     lv_label_set_long_mode(s_body_lbl, LV_LABEL_LONG_MODE_WRAP);
-    lv_obj_set_style_text_font(s_body_lbl, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_align(s_body_lbl, LV_ALIGN_TOP_LEFT, 20, 10);
-    lv_obj_set_style_text_line_space(s_body_lbl, 6, LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_body_lbl, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_body_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(s_body_lbl, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_set_style_text_line_space(s_body_lbl, 10, LV_PART_MAIN);
 
-    const char *boot =
-        "p4browser v3\n\n"
-        "Type a URL on your phone, e.g.:\n\n"
-        "  http://" "192.168.3.129/url?u=example.com\n\n"
-        "(the real LAN IP is shown on boot)";
-    lv_label_set_text(s_body_lbl, boot);
+    /* Pre-remote boot status: shown for the few seconds while Wi-Fi comes up and
+     * buffers allocate, until remote_ui_ready() hides it. If no renderer frame
+     * ever lands, remote.c's boot watchdog opens the config screen with real
+     * instructions. */
+    lv_label_set_text(s_body_lbl,
+        "Connecting to Wi-Fi\nand the renderer…");
     lv_label_set_text(s_title_lbl, "p4browser");
-    lv_label_set_text(s_url_lbl, "ready");
+    lv_label_set_text(s_url_lbl, "connecting");
 
     /* On-screen touch indicator: a big label in a bottom strip showing the
-     * running tap count + last touch coords, so a physical tap is visible to
-     * the camera (the web page content itself has no touch-reactive UI). */
+     * running tap count + last touch coords. Debug only — starts hidden so it
+     * can't overlap the boot text. */
     s_touch_lbl = lv_label_create(scr);
-    lv_obj_set_width(s_touch_lbl, 1280 - 20);
+    lv_obj_set_width(s_touch_lbl, 720);
     lv_label_set_long_mode(s_touch_lbl, LV_LABEL_LONG_MODE_WRAP);
-    lv_obj_set_style_text_font(s_touch_lbl, &lv_font_montserrat_40, LV_PART_MAIN);
-    lv_obj_align(s_touch_lbl, LV_ALIGN_BOTTOM_LEFT, 20, -60);
+    lv_obj_set_style_text_font(s_touch_lbl, &lv_font_montserrat_24, LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_touch_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(s_touch_lbl, LV_ALIGN_BOTTOM_MID, 0, -40);
     lv_obj_set_style_text_color(s_touch_lbl, lv_color_hex(0xFFEB3B), LV_PART_MAIN);
     lv_obj_add_flag(s_touch_lbl, LV_OBJ_FLAG_FLOATING);
     lv_label_set_text(s_touch_lbl, "touch: 0 taps");
+    lv_obj_add_flag(s_touch_lbl, LV_OBJ_FLAG_HIDDEN);
 
     /* Real LVGL button + click counter (ground-truth touch->LVGL test).
      * FULL-SCREEN so a tap anywhere hits it — removes coordinate mapping as a
@@ -817,12 +836,14 @@ static void build_ui(void)
     lv_obj_set_style_border_width(s_click_btn, 0, LV_PART_MAIN);
     lv_obj_add_event_cb(s_click_btn, on_click, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(s_click_btn, on_pressed, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_flag(s_click_btn, LV_OBJ_FLAG_HIDDEN);   /* debug scaffolding */
     s_click_lbl = lv_label_create(scr);
     lv_obj_set_style_text_font(s_click_lbl, &lv_font_montserrat_40, LV_PART_MAIN);
     lv_obj_align(s_click_lbl, LV_ALIGN_TOP_LEFT, 20, 20);
     lv_obj_set_style_text_color(s_click_lbl, lv_color_hex(0x66FF66), LV_PART_MAIN);
     lv_obj_add_flag(s_click_lbl, LV_OBJ_FLAG_FLOATING);
     lv_label_set_text(s_click_lbl, "clicks: 0");
+    lv_obj_add_flag(s_click_lbl, LV_OBJ_FLAG_HIDDEN);   /* was overlapping the title */
 
     /* Crosshair at last tap position (mapping check via camera). Two thin
      * bars forming a "+" 80x80, centered on the reported point by on_pressed. */
@@ -857,6 +878,10 @@ static void build_ui(void)
  * Polls the GSL3680; returns press state + position. Coordinates are in the
  * touch controller's native space (x_max=800, y_max=1280) which already
  * matches the LVGL display size, so no scaling is needed here. */
+void browser_indev_swallow_release(void)
+{
+    s_indev_swallow = true;   /* consumed in touch_read_cb until the finger lifts */
+}
 static void touch_read_cb(lv_indev_t *dev, lv_indev_data_t *data)
 {
     (void)dev;
@@ -879,7 +904,12 @@ static void touch_read_cb(lv_indev_t *dev, lv_indev_data_t *data)
     uint16_t x[1], y[1], str[1];
     uint8_t count = 0;
     esp_lcd_touch_read_data(s_touch);
-    if (!esp_lcd_touch_get_coordinates(s_touch, x, y, str, &count, 1)) {
+    esp_lcd_touch_get_coordinates(s_touch, x, y, str, &count, 1);
+    /* Gesture-hold just opened settings: the finger that held for >3 s is
+     * still down. Drop it (and its release) so it can't be seen as a press
+     * that turns into a click on a button under it. Clear once fully up. */
+    if (s_indev_swallow) {
+        if (count == 0) { s_indev_swallow = false; was_pressed = false; }
         data->state = LV_INDEV_STATE_RELEASED;
         data->point.x = s_touch_last_x;
         data->point.y = s_touch_last_y;

@@ -42,6 +42,7 @@ extern void  browser_ip_get(char *buf, size_t len);
 static lv_obj_t      *s_scr = NULL;
 static lv_obj_t      *s_prev_scr = NULL;
 static lv_obj_t      *s_status = NULL;     /* yellow status line under the title */
+static lv_obj_t      *s_title  = NULL;     /* the "Settings" title label */
 static lv_obj_t      *s_kb = NULL;         /* shared keyboard (shown on focus) */
 static lv_obj_t      *s_kb_target = NULL;
 static lv_obj_t      *s_ta_ssid = NULL;
@@ -54,6 +55,7 @@ static lv_obj_t      *s_slider_lbl = NULL;
 static lv_obj_t      *s_btn_factory = NULL;
 static lv_obj_t      *s_btn_factory_lbl = NULL;
 static volatile bool  s_active = false;
+static volatile bool  s_boot_hint = false;   /* opened by the boot watchdog (no stream) */
 static int64_t        s_factory_arm_ms = 0;
 
 static void set_status(const char *t)
@@ -330,6 +332,7 @@ static void build_settings_screen(void)
 
     /* title + status */
     lv_obj_t *t = lv_label_create(s_scr);
+    s_title = t;
     lv_label_set_text(t, "Settings");
     lv_obj_set_style_text_font(t, &lv_font_montserrat_40, 0);
     lv_obj_set_style_text_color(t, lv_color_white(), 0);
@@ -422,8 +425,8 @@ void settings_open(void)
      * forever if the LVGL task is spinning (the 2026-11-02 wedge: a settings
      * open froze the board, /state and /reboot included). */
     bool re = browser_lvgl_held();
-    if (!re && !browser_lvgl_trylock(2000)) {
-        ESP_LOGE(STAG, "LVGL lock busy >2 s — settings open aborted (LVGL wedged?)");
+    if (!re && !browser_lvgl_trylock(4000)) {
+        ESP_LOGE(STAG, "LVGL lock busy >4 s — settings open aborted (LVGL wedged?)");
         return;
     }
     if (s_active) {
@@ -464,15 +467,42 @@ void settings_open(void)
     browser_fb_invalidate();
     s_prev_scr = lv_screen_active();
     lv_screen_load(s_scr);
-    char st[128];
-    snprintf(st, sizeof(st), "%s  |  %s:%d", ip[0] ? ip : "no IP", host, port);
+    char st[160];
+    if (s_boot_hint) {
+        /* Opened by the boot watchdog because no frame ever arrived. Tell the
+         * user exactly what is wrong and what to do, rather than a black page. */
+        lv_label_set_text(s_title, "Config \xe2\x80\x94 no video yet");
+        if (!ip[0])
+            snprintf(st, sizeof(st),
+                     "No Wi-Fi. Set SSID+password, tap SAVE. IP: none");
+        else
+            snprintf(st, sizeof(st),
+                     "No stream from %s:%d. Check the renderer/PowerHub, or fix the address. IP: %s",
+                     host, port, ip);
+    } else {
+        lv_label_set_text(s_title, "Settings");
+        snprintf(st, sizeof(st), "%s  |  %s:%d", ip[0] ? ip : "no IP", host, port);
+    }
     set_status(st);
     if (!re) browser_lvgl_unlock();
-    ESP_LOGI(STAG, "settings screen open (ip=%s renderer=%s:%d)", ip, host, port);
+    ESP_LOGI(STAG, "settings screen open (ip=%s renderer=%s:%d)%s", ip, host, port,
+             s_boot_hint ? " [boot-hint]" : "");
+}
+
+/* Boot-hint variant: same screen, but with a "why am I seeing this" status.
+ * The boot watchdog calls this when no frame ever arrived. */
+void settings_open_boot(void)
+{
+    if (settings_active()) return;
+    s_boot_hint = true;
+    settings_open();
+    s_boot_hint = false;   /* consumed; a later manual Back/Save clears anyway */
 }
 
 void settings_close(void)
 {
+    s_boot_hint = false;   /* next open is a normal manual open */
+
     /* Re-entrant lock: the settings Back button fires this from an LVGL event
      * callback — INSIDE lv_timer_handler, i.e. with s_lvgl_lock already held
      * by the lvgl task. The old plain browser_lvgl_lock() there was a

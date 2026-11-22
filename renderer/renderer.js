@@ -158,6 +158,15 @@ class Client {
     this.connectedAt = Date.now();
     this.lastMsgAt = Date.now(); // last inbound message (idle-timeout sweeper)
     this.tick = null;            // periodic liveness tick interval (startTick)
+    // Native-touch input mode (RENDERER_TOUCH_INPUT=1). When ON, board touches
+    // are dispatched as REAL touch events (CDP Input.dispatchTouchEvent via
+    // page.touchscreen) instead of synthetic mouse events. This makes
+    // Dashboard Studio's touch-only gestures fire — notably multi-page SWIPE
+    // (its handler binds touchstart/move/end and returns early on mouse unless
+    // gestureTouchOnly===false). Default OFF = byte-for-byte the existing mouse
+    // pipeline, so enabling it is a deliberate, reversible choice.
+    this.touchInput = parseInt(process.env.RENDERER_TOUCH_INPUT, 10) === 1;
+    this.touchActive = false;    // true while a touch point is down (for move/end)
   }
 
   send(obj) {
@@ -240,7 +249,12 @@ class Client {
       this.browser = await launch();
       this.browserUp = true;
       this.page = await this.browser.newPage();
-      await this.page.setViewport({ width: this.width, height: this.height });
+      await this.page.setViewport({
+        width: this.width, height: this.height,
+        // In native-touch mode, advertise a touch-capable device so the page's
+        // touchstart/move/end listeners (Dashboard Studio's swipe engine) fire.
+        ...(this.touchInput ? { hasTouch: true, isMobile: false } : {}),
+      });
       await this.robustGoto(PIN_URL || cfg.url || DEFAULT_URL);
       // FPS TUNING: kill CSS animations + transitions so the Chromium renderer
       // stops continuously re-compositing (it was pegging ~125% CPU on the Pi5,
@@ -535,7 +549,32 @@ class Client {
     // (a tap burst is not a sustained stream).
     this._inputBypassUntil = Date.now() + 3000;
     if (ev.kind === 'down' || ev.kind === 'up')
-      console.log(`[TOUCH-IN] ${new Date(tIn).toISOString()} kind=${ev.kind} board=(${tx},${ty}) page=(${x},${y}) btn=${btn}`);
+      console.log(`[TOUCH-IN] ${new Date(tIn).toISOString()} kind=${ev.kind} board=(${tx},${ty}) page=(${x},${y}) btn=${btn} mode=${this.touchInput ? 'touch' : 'mouse'}`);
+    // ---- Native-touch mode: emit REAL touch events so Dashboard Studio's
+    // touch-only swipe/gesture engine (touchstart/move/end) receives them.
+    if (this.touchInput) {
+      const ts = this.page.touchscreen;
+      try {
+        if (ev.kind === 'down') {
+          this.touchActive = true;
+          await ts.touchStart(x, y);
+        } else if (ev.kind === 'move') {
+          if (this.touchActive) await ts.touchMove(x, y);
+        } else if (ev.kind === 'up') {
+          // touchEnd ends the active point; a fresh down starts the next one.
+          if (this.touchActive) { this.touchActive = false; await ts.touchEnd(); }
+        } else if (ev.kind === 'wheel') {
+          // No native touch wheel; fall back to the mouse wheel (harmless).
+          await m.wheel({ deltaX: ev.dx | 0, deltaY: ev.dy | 0 });
+        }
+      } catch (eTs) {
+        console.log('[TOUCH-IN] touchscreen dispatch failed:', String(eTs && eTs.message || eTs));
+      }
+      if (ev.kind === 'down' || ev.kind === 'up')
+        console.log(`[TOUCH-OUT] ${new Date().toISOString()} kind=${ev.kind} mode=touch cdp=${Date.now() - tIn}ms`);
+      return;
+    }
+    // ---- Default (mouse) pipeline — unchanged behavior.
     switch (ev.kind) {
       case 'down':
         this.mouse.down = true; this.mouse.x = x; this.mouse.y = y;

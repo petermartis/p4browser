@@ -76,6 +76,64 @@ Brief C6 re-init on boot can drop the STA for a few seconds; the board
 recovers (watch `/state` come back). Persistent drop: check the embedded C6
 firmware version matches `esp_hosted` (2.12.12 ↔ `c6_fw_2_12_12.bin`).
 
+### Board black/garbled after a NAS reboot; config screen never appears
+
+The board froze on its last frame when the NAS rebooted and, after a power
+cycle, showed only a black screen or a few overlapping lines of boot text.
+Three independent things, in the order to check:
+
+1. **The renderer (or its boot autostart) is down.** The board retries the
+   renderer forever, and with no frame the panel is a gated black screen.
+   `ps -eo pid,lstart,args | grep '[r]enderer.js'` and compare the start time
+   to `uptime -s`. If the renderer started long after boot (when someone
+   started it by hand), the boot autostart didn't fire.
+
+   **Enabling the systemd *user* unit + linger is necessary but not always
+   sufficient.** On some Synology DSM releases the user session manager starts
+   at boot but does not reliably pull `default.target` wants into it, so
+   `nas-renderer.service` / `nas-dashboard.service` never start until a human
+   logs in. The robust fix is a **root boot trigger** in `/usr/local/etc/rc.d/`
+   that starts the user services explicitly. The DSM journal is `Storage=volatile`
+   by default, so boot-time evidence is wiped by the very reboot you're
+   debugging — switch journald to `persistent` (see `build-and-flash.md`) to get
+   a readable log next time.
+
+   The renderer is normally brought up this way:
+
+   ```sh
+   su - "$RUN_USER" -c 'XDG_RUNTIME_DIR=/run/user/<uid> \
+     DBUS_SESSION_BUS_ADDRESS=unix:path:/run/user/<uid>/bus \
+     systemctl --user start nas-dashboard.service nas-renderer.service'
+   ```
+
+2. **The board has no boot fallback (older firmware).** `remote_ui_ready()`
+   hides the local UI and gates the LVGL flush black as soon as buffers
+   allocate, *before* any connection exists — so "renderer down" looked like a
+   dead black panel with no way to see what was wrong.
+
+   **Fix (in `remote.c`): a boot watchdog.** After entering remote mode, if **no
+   frame arrives within ~30 s**, it opens the **config screen with a
+   mode-aware instruction line** — "No Wi-Fi, set SSID+password, tap SAVE" vs
+   "No stream from `<host>:<port>`, check the renderer / fix the address, IP:
+   …". The moment frames resume it closes itself and retires. It only closes the
+   screen it opened, stops re-opening if you back out, and (by design) **retires
+   permanently after the first frame ever lands** — so a renderer that dies
+   *mid-session* keeps the last good frame (the socket watchdogs drive the
+   reconnect); the config screen is a boot-time safety net, not a mid-session
+   one. `curl http://<board>/state | grep settings:` shows `settings: open=1`
+   when it is up.
+
+   The "stream alive" signal must be **frames *received*, not frames decoded** —
+   while the config screen is up the receive loop still counts frames but skips
+   decoding, so a decoded-count would never detect recovery.
+
+3. **The transient pre-remote boot screen overlapped.** The panel is **portrait
+   800×1280**; local labels laid out at top-left in 1280-wide landscape
+   coordinates stack on top of one another after the 90° rotation — reading as
+   "black with overlapping strings". Keep the boot status a single
+   **centre-aligned** line and start every debug label (URL bar, tap counter,
+   test button) hidden.
+
 ### Board IP unknown / unreachable
 It is DHCP on the home LAN. Reference deployment: `192.168.3.129`. If the
 NAS is on a different subnet, scan for port 80 or use the serial console

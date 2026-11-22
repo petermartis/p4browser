@@ -25,6 +25,7 @@
 
 /* ---- settings.c (LVGL config screen) ---- */
 void  settings_open(void);      /* show the config screen (safe from any task) */
+void  settings_open_boot(void); /* config screen + "no video yet" instructions (any task) */
 void  settings_close(void);     /* back to the previous screen (any task) */
 bool  settings_active(void);    /* is the config screen up right now */
 void  settings_diag(char *buf, size_t len, size_t *o);   /* /state line */

@@ -100,6 +100,7 @@ static void cfg_load(void)
 extern esp_lcd_touch_handle_t remote_touch_handle(void);   /* returns s_touch */
 extern void *remote_fb_addr(void);                          /* returns s_fb0 (uint8_t*) */
 extern void   remote_ui_ready(void);                        /* hide text UI (browser.c) */
+extern void   browser_indev_swallow_release(void);          /* (browser.c) drop the gesture-hold's release */
 
 /* ---- stats (reported in /state) ---- */
 static volatile int     s_connect_attempts = 0;
@@ -128,6 +129,12 @@ static volatile bool    s_remote_active    = false;   /* WS connected right now 
 static volatile int64_t s_last_frame_ms    = 0;
 static volatile int64_t s_last_msg_ms      = 0;   /* last inbound WS msg of ANY type (frames, hello, tick) — used to detect a half-open socket (board can send pings but renderer->board direction is dead) and force a reconnect */
 static volatile int64_t s_last_pong_ms     = 0;   /* last 'pong' from the renderer. The board pings every 20s and the renderer replies 'pong'. If frames keep arriving (renderer->board alive) but the pong stops, the BOARD->renderer direction is dead (our pings/touch are being dropped). recv never errors and s_last_msg_ms stays fresh from inbound frames, so neither the silent- nor the no-frame check fires — the pong timeout is the ONLY way to catch this one-directional half-open state. */
+/* Boot watchdog: if no frame has EVER been received by the time we'd expect
+ * one, the renderer (or Wi-Fi) is down — the black gated screen the user then
+ * sees is a dead end. Auto-open the config screen with instructions instead,
+ * and close it the moment video recovers. s_boot_hint_open = WE opened it. */
+static volatile bool    s_boot_hint_open   = false;
+static volatile int64_t s_boot_ref_ms      = 0;    /* remote_task connect-loop start */
 static char s_last_err[96] = {0};
 static char s_title[96]    = {0};
 
@@ -658,7 +665,50 @@ static void touch_to_page(uint32_t nx, uint32_t ny, uint32_t *px, uint32_t *py)
 static void cfg_open_worker(void *arg)
 {
     (void)arg;
+    /* The >3 s hold that fired this is still pressed. Swallow its release so
+     * LVGL (now the sole touch reader once settings is up) can't turn it into
+     * a click on a button under the finger — that was closing the screen the
+     * instant it opened. Only the gesture path does this; HTTP open has no
+     * pending finger. */
+    browser_indev_swallow_release();
     settings_open();
+    vTaskDelete(NULL);
+}
+
+/* Boot watchdog. remote_ui_ready() gates the display black and remote_task then
+ * retries ws_connect() forever — so if the renderer (or Wi-Fi) is down after a
+ * NAS reboot, the user is stuck on a black screen with no way to fix it. This
+ * task gives them the config screen instead: if NO frame has arrived within a
+ * grace window, open settings with "why you're seeing this" instructions. Once a
+ * frame lands (renderer recovered), close it and retire. It only ever closes the
+ * screen IT opened — a manual long-press is never touched. s_frames_rx (not
+ * decoded) is the "stream alive" signal, because rx still counts frames while
+ * the settings screen is up and decode is gated off. */
+static void boot_watchdog(void *arg)
+{
+    (void)arg;
+    const int64_t BOOT_GRACE_MS = 30000;   /* DHCP + C6 boot + Chrome cold start slack */
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (s_remote_stop) break;
+        if (s_frames_rx > 0) {              /* stream proved alive (even while gated) → done */
+            if (s_boot_hint_open) { settings_close(); s_boot_hint_open = false; }
+            break;
+        }
+        int64_t since = esp_timer_get_time() / 1000 - s_boot_ref_ms;
+        if (since < BOOT_GRACE_MS) continue;
+        if (s_boot_hint_open) {
+            /* already showing it; if the user backed out of it, respect that */
+            if (!settings_active()) break;
+            continue;                        /* still up, waiting for the renderer to return */
+        }
+        if (settings_active()) continue;     /* user opened it themselves — don't fight them */
+        ESP_LOGW(RTAG, "boot watchdog: no frame after %lld ms — opening config screen",
+                 (long long)since);
+        settings_open_boot();
+        s_boot_hint_open = true;
+    }
+    ESP_LOGI(RTAG, "boot watchdog retiring (frames_rx=%d)", s_frames_rx);
     vTaskDelete(NULL);
 }
 
@@ -840,6 +890,14 @@ static void remote_task(void *arg)
     remote_ui_ready();
     ESP_LOGI(RTAG, "DBG-RT: step7 remote_ui_ready done");
     ESP_LOGI(RTAG, "remote UI active — waiting for renderer frames");
+
+    /* Start the boot watchdog clock at "remote mode active" and launch it. If
+     * no frame lands within the grace window (renderer or Wi-Fi down), it shows
+     * the config screen instead of leaving a dead black panel. 12 KB unpinned,
+     * prio 5 — identical to cfg_open_worker, which runs the same LVGL build. */
+    s_boot_hint_open = false;
+    s_boot_ref_ms    = esp_timer_get_time() / 1000;
+    xTaskCreate(boot_watchdog, "bootwd", 12288, NULL, 5, NULL);
 
     for (;;) {
         s_connect_attempts++;

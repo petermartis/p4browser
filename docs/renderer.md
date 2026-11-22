@@ -80,6 +80,27 @@ coordinate conversion (it knows the physical geometry); the renderer just
 injects. Per-event log line: `[TOUCH-IN] cdp=Nms` — the CDP injection cost
 (~1–140 ms measured; not a latency concern).
 
+### Native touch / swipe mode (`RENDERER_TOUCH_INPUT=1`)
+
+By default the renderer injects CDP *mouse* events: a board tap becomes a mouse
+press+release at the point. That is right for a dashboard's switches/sliders but
+it prevents the page's own **native touch gestures** — swiping a Dashboard
+Studio multi-page dashboard between pages, momentum, pull-to-refresh — from
+working, because those listen for *touch* events and `touch-action` CSS.
+
+`RENDERER_TOUCH_INPUT=1` (default **0** = mouse, the safe default that preserves
+the existing tap-to-toggle behaviour) routes each board gesture through
+`Input.dispatchTouchEvent` (touchStart/touchMove/touchEnd) instead. The board
+already streams continuous `down → move* → up` points during a press (5 ms poll),
+so a finger-drag on the panel becomes a real swipe on the page — **no board
+firmware change is needed**; the wire protocol and the board→page coordinate
+transform are identical, only the injected event type changes. Set it on the
+renderer (e.g. `Environment=RENDERER_TOUCH_INPUT=1` in the systemd unit), not on
+the board. A tap still registers (a zero-distance touchStart/End is a tap), so
+switches/widgets keep working; if a given page's CSS makes a native touch swipe
+land on the wrong page, that is a page-side `touch-action`/`overscroll` issue —
+set `RENDERER_TOUCH_INPUT=0` to revert to mouse taps.
+
 ## WebSocket protocol (board ⇄ renderer)
 
 - Board connects out to `ws://<renderer>:9100` (renderer listens on `PORT`,
@@ -137,6 +158,7 @@ flash, the existing page just re-navigates.
 | `RENDERER_SHOT_TIMEOUT_MS` | — | set | Screenshot timeout |
 | `RENDERER_SHOT_RELOAD_AFTER` | — | 8 | Consecutive timeouts before page reload (self-heal) |
 | `RENDERER_SCREENCAST` | 0 | 0 | 1 = use Chrome screencast (event-driven) instead of one-shot captures |
+| `RENDERER_TOUCH_INPUT` | 0 | 0 | 1 = inject native touch (swipe) instead of mouse taps (see §Native touch / swipe mode) |
 | `RENDERER_KILL_ANIM` | — | — | Experimental animation kill-switch |
 | `RENDERER_LOG` | — | `/tmp/renderer_nas.log` | Log file (DSM user journals are not readable from the shell — use this) |
 
